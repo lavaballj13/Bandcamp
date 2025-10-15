@@ -1,0 +1,60 @@
+{
+  "as_of": "2025-10-15",
+  "baseline_date": "2025-07-17",
+  "capital": 1000.0,
+  "total_mv_price": 94.18775173389395,
+  "roc_price": -0.9146739834362247,
+  "roc_total_return": -0.9148900408437273,
+  "allocation": [
+    {
+      "ticker": "TQQQ",
+      "price": NaN,
+      "mkt_value": 0.0,
+      "weight": 0.0,
+      "target_w": 0.3,
+      "band_lo": 0.19,
+      "band_hi": 0.37,
+      "status": "LOW"
+    },
+    {
+      "ticker": "GLD",
+      "price": NaN,
+      "mkt_value": 0.0,
+      "weight": 0.0,
+      "target_w": 0.2,
+      "band_lo": 0.15,
+      "band_hi": 0.25,
+      "status": "LOW"
+    },
+    {
+      "ticker": "XLP",
+      "price": NaN,
+      "mkt_value": 0.0,
+      "weight": 0.0,
+      "target_w": 0.2,
+      "band_lo": 0.15,
+      "band_hi": 0.25,
+      "status": "LOW"
+    },
+    {
+      "ticker": "DBMF",
+      "price": NaN,
+      "mkt_value": 0.0,
+      "weight": 0.0,
+      "target_w": 0.2,
+      "band_lo": 0.15,
+      "band_hi": 0.25,
+      "status": "LOW"
+    },
+    {
+      "ticker": "BTC-USD",
+      "price": 112356.421875,
+      "mkt_value": 94.18775173389395,
+      "weight": 1.0,
+      "target_w": 0.1,
+      "band_lo": 0.045,
+      "band_hi": 0.36,
+      "status": "HIGH"
+    }
+  ]
+}
