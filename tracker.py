@@ -64,6 +64,24 @@ def _warn(*a):
 def _err(*a):
     print("[error]", *a, flush=True)
 
+def _collapse_history_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Sort by date, then keep the LAST row per calendar date (idempotent)."""
+    if df is None or len(df) == 0:
+        return df
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
+    # group by calendar day, keep last occurrence
+    g = df.groupby(df["date"].dt.date, as_index=False).last()
+    g["date"] = pd.to_datetime(g["date"])
+    return g
+
+def _load_history_collapsed(path=HISTORY_CSV) -> pd.DataFrame | None:
+    if not Path(path).exists():
+        return None
+    df = pd.read_csv(path, parse_dates=["date"])
+    return _collapse_history_df(df)
+
 # ============================ Core helpers ============================
 
 def load_portfolio(path=PORTFOLIO_CSV) -> pd.DataFrame:
@@ -328,13 +346,40 @@ def email_send(subject, body, attachments=None):
         _warn(f"email_send failed: {repr(e)}")
 
 def update_history(history_path, dt_label, mv_price, roc_price, mv_tr, roc_tr):
+    """
+    Upsert: ensure only one row per calendar date (keep the latest).
+    """
     path = Path(history_path)
-    row = f"{dt_label},{mv_price:.2f},{roc_price:.6f},{mv_tr:.2f},{roc_tr:.6f}\n"
-    if not path.exists():
-        path.write_text("date,mv_price,roc_price,mv_tr,roc_total_return\n" + row)
+    cols = ["date", "mv_price", "roc_price", "mv_tr", "roc_total_return"]
+
+    # build the new row (date only; no time) for idempotency
+    day = pd.to_datetime(str(dt_label)).date().isoformat()
+    new_row = pd.DataFrame([{
+        "date": day,
+        "mv_price": float(mv_price),
+        "roc_price": float(roc_price),
+        "mv_tr": float(mv_tr),
+        "roc_total_return": float(roc_tr),
+    }], columns=cols)
+
+    if path.exists():
+        try:
+            df = pd.read_csv(path, parse_dates=["date"])
+        except Exception:
+            df = pd.DataFrame(columns=cols)
+        # collapse any existing dup dates, then drop today's if present
+        df = _collapse_history_df(df)
+        if len(df):
+            df = df[df["date"].dt.date.astype(str) != day]
+        df = pd.concat([df, new_row], ignore_index=True)
     else:
-        with path.open("a") as f:
-            f.write(row)
+        df = new_row
+
+    # final ordering / formatting
+    df = df.sort_values("date")
+    df_out = df.copy()
+    df_out["date"] = df_out["date"].dt.strftime("%Y-%m-%d")
+    df_out.to_csv(path, index=False)
 
 def load_signals_state(path=SIGNALS_JSON):
     if Path(path).exists():
@@ -479,12 +524,13 @@ def weekly_job():
         alloc, total_mv_price, idx_price = compute_weights_from_baseline(port, last_close, base_close)
 
         # Read history for basic spans
+        # Load history collapsed to one row per calendar date (keep latest)
         hist = None
-        if Path(HISTORY_CSV).exists():
-            try:
-                hist = pd.read_csv(HISTORY_CSV, parse_dates=["date"]).sort_values("date")
-            except Exception as e:
-                _warn(f"failed to read history.csv: {e}")
+        try:
+            hist = _load_history_collapsed(HISTORY_CSV)
+        except Exception as e:
+            _warn(f"failed to read/collapse history.csv: {e}")
+
 
         def span_return(colname, days):
             if hist is None or len(hist) < 2:
