@@ -1,0 +1,35 @@
+name: daily-eod
+on:
+  schedule:
+    - cron: "10 21 * * 1-5"   # ~ 21:10 UTC ≈ 4:10pm ET during ST, 5:10pm ET during DST; safe buffer
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas yfinance
+      - name: Daily EOD
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
+        run: |
+          set -e
+          python tracker.py daily || (echo "retrying..." && sleep 5 && python tracker.py daily)
+
+      - name: Commit artifacts
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.csv status.json signals_state.json || true
+          git commit -m "daily update" || echo "no changes"
+          git push || true
