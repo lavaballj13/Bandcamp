@@ -1,0 +1,15 @@
+name: cron-probe
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Show event + times
+        run: |
+          echo "EVENT: $GITHUB_EVENT_NAME"
+          echo "UTC now:    $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Runner TZ:  $(date '+%Z %Y-%m-%d %H:%M:%S')"
