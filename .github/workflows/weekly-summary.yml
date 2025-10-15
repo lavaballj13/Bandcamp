@@ -4,6 +4,9 @@ on:
     - cron: "00 15 * * 6"  # Sat 15:00 UTC (~09:00 America/Denver)
   workflow_dispatch: {}
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
