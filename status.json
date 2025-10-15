@@ -2,59 +2,59 @@
   "as_of": "2025-10-15",
   "baseline_date": "2025-07-17",
   "capital": 1000.0,
-  "total_mv_price": 94.18775173389395,
-  "roc_price": -0.9146739834362247,
-  "roc_total_return": -0.9148900408437273,
+  "total_mv_price": 1115.1110217939254,
+  "roc_price": 0.01019484767887624,
+  "roc_total_return": 0.01018426730601063,
   "allocation": [
     {
       "ticker": "TQQQ",
-      "price": NaN,
-      "mkt_value": 0.0,
-      "weight": 0.0,
+      "price": 103.19999694824219,
+      "mkt_value": 355.6576450211563,
+      "weight": 0.31894370880577894,
       "target_w": 0.3,
       "band_lo": 0.19,
       "band_hi": 0.37,
-      "status": "LOW"
+      "status": "OK"
     },
     {
       "ticker": "GLD",
-      "price": NaN,
-      "mkt_value": 0.0,
-      "weight": 0.0,
+      "price": 387.3900146484375,
+      "mkt_value": 251.88726503503435,
+      "weight": 0.2258853693597368,
       "target_w": 0.2,
       "band_lo": 0.15,
       "band_hi": 0.25,
-      "status": "LOW"
+      "status": "OK"
     },
     {
       "ticker": "XLP",
-      "price": NaN,
-      "mkt_value": 0.0,
-      "weight": 0.0,
+      "price": 79.2300033569336,
+      "mkt_value": 195.3643268665491,
+      "weight": 0.1751971983491459,
       "target_w": 0.2,
       "band_lo": 0.15,
       "band_hi": 0.25,
-      "status": "LOW"
+      "status": "OK"
     },
     {
       "ticker": "DBMF",
-      "price": NaN,
-      "mkt_value": 0.0,
-      "weight": 0.0,
+      "price": 28.200000762939453,
+      "mkt_value": 219.36990872917312,
+      "weight": 0.19672472466128407,
       "target_w": 0.2,
       "band_lo": 0.15,
       "band_hi": 0.25,
-      "status": "LOW"
+      "status": "OK"
     },
     {
       "ticker": "BTC-USD",
-      "price": 112356.421875,
-      "mkt_value": 94.18775173389395,
-      "weight": 1.0,
+      "price": 110739.0,
+      "mkt_value": 92.8318761420123,
+      "weight": 0.08324899882405414,
       "target_w": 0.1,
       "band_lo": 0.045,
       "band_hi": 0.36,
-      "status": "HIGH"
+      "status": "OK"
     }
   ]
 }
