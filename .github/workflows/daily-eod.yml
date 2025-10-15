@@ -1,23 +1,30 @@
 name: daily-eod
+
 on:
   schedule:
-    - cron: '10 21 * * 1-5'
+    - cron: '10 21 * * 1-5'   # runs ~after US market close (UTC)
   workflow_dispatch:
+
 permissions:
   contents: write
-
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install pandas yfinance
-      - name: Daily EOD
+
+      - name: Install dependencies
+        run: pip install -q pandas yfinance
+
+      - name: Daily EOD (updates artifacts)
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -25,11 +32,31 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO:   ${{ secrets.MAIL_TO }}
+          EMAIL_DISABLE: "0"
+          LOCK_TO_EQUITY_CLOSE: "1"  # anchor to last full equity close if run pre-open
+          TRACKER_DEBUG: "1"
         run: |
           set -e
-          python tracker.py daily || (echo "retrying..." && sleep 5 && python tracker.py daily)
+          python tracker.py daily || (echo "retrying daily..." && sleep 5 && python tracker.py daily)
+
+      - name: Force daily recap email (call weekly)
+        if: always()
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
+          EMAIL_DISABLE: "0"
+          LOCK_TO_EQUITY_CLOSE: "1"
+          TRACKER_DEBUG: "1"
+        run: |
+          set -e
+          python tracker.py weekly || (echo "retrying weekly..." && sleep 5 && python tracker.py weekly)
 
       - name: Commit artifacts
+        if: always()
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
