@@ -1,8 +1,8 @@
 name: cron-probe
 on:
   schedule:
-    - cron: "*/5 * * * *"   # every 5 minutes
-  workflow_dispatch: {}
+    - cron: '*/5 * * * *'   # every 5 minutes (UTC)
+  workflow_dispatch:
 
 jobs:
   probe:
@@ -10,6 +10,6 @@ jobs:
     steps:
       - name: Show event + times
         run: |
-          echo "EVENT: $GITHUB_EVENT_NAME"
+          echo "EVENT: ${{ github.event_name }}"
           echo "UTC now:    $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
           echo "Runner TZ:  $(date '+%Z %Y-%m-%d %H:%M:%S')"
