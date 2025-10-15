@@ -1,0 +1,44 @@
+name: repair-history
+on:
+  workflow_dispatch:   # manual only
+
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install pandas
+        run: pip install -q pandas
+
+      - name: Repair history.csv (dedupe by date, keep last)
+        run: |
+          python - <<'PY'
+          import pandas as pd, pathlib
+          p = pathlib.Path("history.csv")
+          if p.exists():
+              df = pd.read_csv(p, parse_dates=["date"]).sort_values("date")
+              df = df.groupby(df["date"].dt.date, as_index=False).last()
+              df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
+              df.to_csv(p, index=False)
+              print("Rewrote history.csv with", len(df), "rows")
+          else:
+              print("history.csv missing; nothing to repair")
+          PY
+
+      - name: Commit repaired file
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add history.csv || true
+          git commit -m "repair history.csv" || echo "no changes"
+          git push || true
