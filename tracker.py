@@ -26,7 +26,7 @@ import yfinance as yf
 
 # ---------- User-configurable knobs ----------
 NOTIONAL_CAPITAL   = 1000.0                 # $ used for synthetic portfolio value calc
-BASELINE_DATE      = ""                     # "" => set on first run (today's last bar). Or set "YYYY-MM-DD".
+BASELINE_DATE = "2025-07-17"
 TZ_USER            = ZoneInfo("America/Denver")  # your local TZ for display
 ALWAYS_ALERT_ON_BREACH = False              # True => email any day breaches exist; False => only when state changes
 
