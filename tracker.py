@@ -26,7 +26,7 @@ import yfinance as yf
 
 # ---------- User-configurable knobs ----------
 NOTIONAL_CAPITAL   = 1000.0                 # $ used for synthetic portfolio value calc
-BASELINE_DATE      = ""                     # "" => set on first run (today's last bar). Or set "YYYY-MM-DD" to backdate.
+BASELINE_DATE      = ""                     # "" => set on first run (today's last bar). Or set "YYYY-MM-DD".
 TZ_USER            = ZoneInfo("America/Denver")  # your local TZ for display
 ALWAYS_ALERT_ON_BREACH = False              # True => email any day breaches exist; False => only when state changes
 
@@ -78,7 +78,6 @@ def _last_series(frame, field, tickers):
         ser.index = ser.index.astype(str)
         return pd.Series(ser, dtype="float64").reindex(tickers)
     else:
-        # single ticker case
         return pd.Series({tickers[0]: frame[field].iloc[-1]})
 
 def _two_series(frame, field, tickers):
@@ -101,27 +100,28 @@ def load_or_create_baseline(tickers, baseline_date=BASELINE_DATE):
 
     # Need to create baseline
     if baseline_date:
-        # Pull a wider window around baseline_date
         hist = yf.download(tickers=tickers, start=baseline_date, end=None,
                            interval="1d", auto_adjust=False, progress=False, group_by="column")
-        # pick the earliest row >= baseline_date
-        if isinstance(hist.index, pd.DatetimeIndex) and len(hist.index):
-            # Use the first available bar as baseline
-            base_dt = pd.Timestamp(hist.index[0]).tz_localize(None)
-        else:
+        if not isinstance(hist.index, pd.DatetimeIndex) or not len(hist.index):
             raise RuntimeError("Could not fetch data to create baseline; check BASELINE_DATE or tickers.")
+        base_dt = pd.Timestamp(hist.index[0]).tz_localize(None)
+        def pick_field(field):
+            if isinstance(hist.columns, pd.MultiIndex):
+                ser = hist[field].iloc[0]
+                ser.index = ser.index.astype(str)
+                return pd.Series(ser, dtype="float64").reindex(tickers)
+            else:
+                return pd.Series({tickers[0]: hist[field].iloc[0]})
     else:
-        # No baseline date provided; use last bar of a short fetch
         hist = _yf_download(tickers, period="7d", interval="1d")
         base_dt = pd.Timestamp(hist.index[-1]).tz_localize(None)
-
-    def pick_field(field):
-        if isinstance(hist.columns, pd.MultiIndex):
-            ser = hist[field].iloc[0]  # first bar chosen as baseline
-            ser.index = ser.index.astype(str)
-            return pd.Series(ser, dtype="float64").reindex(tickers)
-        else:
-            return pd.Series({tickers[0]: hist[field].iloc[0]})
+        def pick_field(field):
+            if isinstance(hist.columns, pd.MultiIndex):
+                ser = hist[field].iloc[-1]
+                ser.index = ser.index.astype(str)
+                return pd.Series(ser, dtype="float64").reindex(tickers)
+            else:
+                return pd.Series({tickers[0]: hist[field].iloc[-1]})
 
     base_close = pick_field("Close").fillna(method="ffill")
     base_adj   = pick_field("Adj Close").fillna(method="ffill")
@@ -143,13 +143,10 @@ def compute_weights_from_baseline(port, last_close, base_close):
     Returns: alloc df with weight, synthetic $ mkt_value, price column
     """
     tickers = port["ticker"].tolist()
-    # growth index since baseline
     base_vec = pd.Series({t: base_close.get(t, np.nan) for t in tickers}, dtype="float64")
     last_vec = last_close.reindex(tickers)
     idx = (last_vec / base_vec).replace([np.inf, -np.inf], np.nan).fillna(0.0).clip(lower=0.0)
 
-    # synthetic value per asset from target weight and NOTIONAL_CAPITAL
-    # V_i(t) = NOTIONAL * target_w_i * idx_i(t)
     val = NOTIONAL_CAPITAL * port["target_w"].to_numpy(float) * idx.to_numpy(float)
     total_mv = float(np.nansum(val))
     weight = (val / total_mv) if total_mv > 0 else np.zeros_like(val)
@@ -159,7 +156,6 @@ def compute_weights_from_baseline(port, last_close, base_close):
     out["mkt_value"] = val
     out["weight"] = weight
 
-    # band status
     def band_status(row):
         w, lo, hi = float(row["weight"]), float(row["band_lo"]), float(row["band_hi"])
         if np.isnan(w) or np.isnan(lo) or np.isnan(hi):
@@ -257,28 +253,22 @@ def daily_job():
     port = load_portfolio()
     tickers = port["ticker"].tolist()
 
-    # Baseline
     baseline = load_or_create_baseline(tickers, baseline_date=BASELINE_DATE)
     base_close = baseline["base_close"]
     base_adj   = baseline["base_adj"]
     capital    = float(baseline.get("capital", NOTIONAL_CAPITAL))
 
-    # Pull latest close/adj
     data = _yf_download(tickers, period="7d", interval="1d")
     last_close = _last_series(data, "Close", tickers)
     last_adj   = _last_series(data, "Adj Close", tickers)
     last_dt    = pd.Timestamp(data.index[-1]).tz_localize(None)
 
-    # Allocation from baseline (weights & current synthetic MV)
     alloc, total_mv_price, idx_price = compute_weights_from_baseline(port, last_close, base_close)
 
-    # Daily ROC (price & TR proxy) using last two rows
     d2 = _yf_download(tickers, period="3d", interval="1d")
     c_prev, c_now = _two_series(d2, "Close", tickers)
     a_prev, a_now = _two_series(d2, "Adj Close", tickers)
 
-    # Synthetic MV using baseline method:
-    # MV(t) = capital * sum_i t_i * (P_i(t)/P_i(0))
     base_close_ser = pd.Series(base_close, dtype="float64").reindex(tickers)
     base_adj_ser   = pd.Series(base_adj,   dtype="float64").reindex(tickers)
     targ           = port["target_w"].to_numpy(float)
@@ -291,14 +281,12 @@ def daily_job():
     mv_now_tr  = capital * float(np.nansum(targ * (a_now.to_numpy()  / base_adj_ser.to_numpy())))
     roc_tr     = (mv_now_tr / mv_prev_tr - 1.0) if mv_prev_tr > 0 else 0.0
 
-    # Signals
     signals = detect_signals(alloc)
     prev_state = load_signals_state()
     today_state = { s["ticker"]: s["status"] for s in signals }
     changed = (today_state != prev_state)
     save_signals_state(today_state)
 
-    # Save artifacts
     update_history(HISTORY_CSV, last_dt.date().isoformat(), mv_now_price, roc_price, mv_now_tr, roc_tr)
     snapshot = {
         "as_of": str(last_dt.date()),
@@ -311,7 +299,6 @@ def daily_job():
     }
     Path(STATUS_JSON).write_text(json.dumps(snapshot, indent=2))
 
-    # Email if signals exist (and changed, unless ALWAYS_ALERT_ON_BREACH)
     if signals and (ALWAYS_ALERT_ON_BREACH or changed):
         header = f"As of {last_dt.date().isoformat()} (EOD)"
         body  = header + "\n\n"
@@ -345,7 +332,6 @@ def weekly_job():
 
     alloc, total_mv_price, idx_price = compute_weights_from_baseline(port, last_close, base_close)
 
-    # Read history for basic spans
     hist = None
     if Path(HISTORY_CSV).exists():
         hist = pd.read_csv(HISTORY_CSV, parse_dates=["date"]).sort_values("date")
@@ -359,13 +345,11 @@ def weekly_job():
         return (end / start - 1.0) if start else np.nan
 
     ret_1w  = span_return("mv_tr", 5)
-    # MTD
     ret_mtd = np.nan
     if hist is not None and len(hist):
         this_month = hist[hist["date"].dt.to_period("M") == hist["date"].iloc[-1].to_period("M")]
         if len(this_month) >= 2:
             ret_mtd = this_month["mv_tr"].iloc[-1] / this_month["mv_tr"].iloc[0] - 1.0
-    # YTD
     ret_ytd = np.nan
     if hist is not None and len(hist):
         this_year = hist[hist["date"].dt.year == hist["date"].iloc[-1].year]
