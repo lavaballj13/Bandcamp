@@ -65,28 +65,58 @@ def load_portfolio(path=PORTFOLIO_CSV) -> pd.DataFrame:
         df["target_w"] = tw
     return df
 
-def _yf_download(tickers, period="7d", interval="1d"):
-    return yf.download(
-        tickers=tickers, period=period, interval=interval,
-        auto_adjust=False, progress=False, group_by="column"
-    )
+# --- replace these helpers in tracker.py ---
+
+def _yf_download(tickers, period="7d", interval="1d", tries=3):
+    """Robust yfinance download with small retries; returns a DataFrame (possibly empty)."""
+    last_err = None
+    for k in range(tries):
+        try:
+            df = yf.download(
+                tickers=tickers, period=period, interval=interval,
+                auto_adjust=False, progress=False, group_by="column", threads=True
+            )
+            # If MultiIndex columns and completely empty, yfinance may return an empty frame with columns set.
+            if isinstance(df, pd.DataFrame) and len(df) >= 1:
+                return df
+        except Exception as e:
+            last_err = e
+        # brief backoff
+        import time; time.sleep(1.0 + 0.5*k)
+    # return empty frame if all tries fail
+    return pd.DataFrame()
 
 def _last_series(frame, field, tickers):
-    """Get last row Series for field ('Close' / 'Adj Close') from yfinance frame."""
+    """Get last-row Series for field; if empty, return NaNs indexed by tickers."""
+    if not isinstance(frame, pd.DataFrame) or len(frame) == 0:
+        return pd.Series({t: np.nan for t in tickers}, dtype="float64")
+
     if isinstance(frame.columns, pd.MultiIndex):
         ser = frame[field].iloc[-1]
         ser.index = ser.index.astype(str)
         return pd.Series(ser, dtype="float64").reindex(tickers)
     else:
+        # single ticker case
         return pd.Series({tickers[0]: frame[field].iloc[-1]})
 
 def _two_series(frame, field, tickers):
-    """Get last two rows Series for field."""
+    """Return (prev, now) Series for field; if <2 rows, duplicate the last (or fill NaNs)."""
+    if not isinstance(frame, pd.DataFrame) or len(frame) == 0:
+        s_nan = pd.Series({t: np.nan for t in tickers}, dtype="float64")
+        return s_nan, s_nan
+    if len(frame) == 1:
+        # duplicate the only row
+        if isinstance(frame.columns, pd.MultiIndex):
+            only_ = frame[field].iloc[-1]
+            only_.index = only_.index.astype(str)
+            s = pd.Series(only_, dtype="float64").reindex(tickers)
+        else:
+            s = pd.Series({tickers[0]: frame[field].iloc[-1]})
+        return s, s
+
     if isinstance(frame.columns, pd.MultiIndex):
-        prev_ = frame[field].iloc[-2]
-        now_  = frame[field].iloc[-1]
-        prev_.index = prev_.index.astype(str)
-        now_.index  = now_.index.astype(str)
+        prev_ = frame[field].iloc[-2]; now_ = frame[field].iloc[-1]
+        prev_.index = prev_.index.astype(str); now_.index = now_.index.astype(str)
         return (pd.Series(prev_, dtype="float64").reindex(tickers),
                 pd.Series(now_,  dtype="float64").reindex(tickers))
     else:
@@ -258,10 +288,15 @@ def daily_job():
     base_adj   = baseline["base_adj"]
     capital    = float(baseline.get("capital", NOTIONAL_CAPITAL))
 
-    data = _yf_download(tickers, period="7d", interval="1d")
+    data = _yf_download(tickers, period="7d", interval="1d", tries=3)
     last_close = _last_series(data, "Close", tickers)
     last_adj   = _last_series(data, "Adj Close", tickers)
-    last_dt    = pd.Timestamp(data.index[-1]).tz_localize(None)
+    if isinstance(data.index, pd.DatetimeIndex) and len(data.index) >= 1:
+        last_dt = pd.Timestamp(data.index[-1]).tz_localize(None)
+    else:
+        # fallback: use today (UTC) so the run doesn’t crash; weights will be NaN and we’ll skip email
+        last_dt = pd.Timestamp.utcnow().tz_localize(None)
+
 
     alloc, total_mv_price, idx_price = compute_weights_from_baseline(port, last_close, base_close)
 
