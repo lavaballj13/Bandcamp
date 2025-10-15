@@ -1,11 +1,11 @@
 name: daily-eod
 on:
   schedule:
-    - cron: "10 21 * * 1-5"   # ~ 21:10 UTC ≈ 4:10pm ET (ST) / 5:10pm ET (DST)
-  workflow_dispatch: {}
-
+    - cron: '10 21 * * 1-5'
+  workflow_dispatch:
 permissions:
   contents: write
+
 
 jobs:
   run:
