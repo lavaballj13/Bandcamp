@@ -1,0 +1,105 @@
+name: diag
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/30 * * * *'  # every 30 min (remove later)
+
+permissions:
+  contents: read
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Print basics
+        run: |
+          echo "EVENT: ${{ github.event_name }}"
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Runner TZ: $(date '+%Z %Y-%m-%d %H:%M:%S')"
+          echo "Python:"
+          python3 --version
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install --disable-pip-version-check -q pandas yfinance
+
+      - name: Show repo files
+        run: |
+          ls -al
+          echo "---- portfolio.csv ----"
+          cat portfolio.csv || true
+          echo "---- baseline.json ----"
+          test -f baseline.json && cat baseline.json || echo "baseline.json not present (will be created by tracker.py)"
+
+      - name: Check secrets presence (not values)
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
+        run: |
+          python - <<'PY'
+          import os, json
+          keys = ["SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASS","MAIL_FROM","MAIL_TO"]
+          print("Secrets presence:", {k: ("SET" if os.getenv(k) else "MISSING") for k in keys})
+          PY
+
+      - name: yfinance smoke test from portfolio.csv
+        run: |
+          python - <<'PY'
+          import pandas as pd, numpy as np, yfinance as yf, sys
+          try:
+              port = pd.read_csv("portfolio.csv")
+              tickers = port["ticker"].astype(str).tolist()
+              print("Tickers:", tickers)
+          except Exception as e:
+              print("Failed to read portfolio.csv:", e); sys.exit(1)
+
+          for period in ["3d","7d"]:
+              df = yf.download(tickers=tickers, period=period, interval="1d", auto_adjust=False, progress=False, group_by="column")
+              print(f"\n=== yf.download period={period} shape={getattr(df,'shape',None)} index_len={len(getattr(df,'index',[]))} ===")
+              try:
+                  print("Index tail:", df.index[-3:])
+              except Exception as e:
+                  print("Index tail unavailable:", e)
+              # Verify needed fields exist
+              fields = ["Close","Adj Close"]
+              for f in fields:
+                  try:
+                      if hasattr(df, "columns") and isinstance(df.columns, pd.MultiIndex):
+                          sub = df[f].iloc[-1:]
+                          print(f"[OK] field {f} last row columns: {list(sub.columns.astype(str))[:5]}...")
+                      else:
+                          print(f"[OK] single-ticker field {f} present")
+                  except Exception as e:
+                      print(f"[ERR] field {f} missing or invalid:", e)
+          PY
+
+      - name: Try running tracker (no email, keep job green)
+        env:
+          # Optional switches if we patch tracker.py to respect them
+          TRACKER_DEBUG: "1"
+          EMAIL_DISABLE: "1"
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO:   ${{ secrets.MAIL_TO }}
+        run: |
+          set +e
+          echo "---- python tracker.py daily ----"
+          python tracker.py daily
+          echo "exit_code=$?"
+          echo "---- python tracker.py weekly ----"
+          python tracker.py weekly
+          echo "exit_code=$?"
