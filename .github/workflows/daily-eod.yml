@@ -2,7 +2,7 @@ name: daily-eod
 
 on:
   schedule:
-    - cron: '10 21 * * 1-5'   # runs ~after US market close (UTC)
+    - cron: '10 21 * * 1-5'   # weekdays @ 21:10 UTC (close-ish; DST shifts vs ET)
   workflow_dispatch:
 
 permissions:
@@ -22,9 +22,9 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
-        run: pip install -q pandas yfinance
+        run: pip install -q pandas numpy yfinance
 
-      - name: Daily EOD (updates artifacts)
+      - name: Daily EOD (signals + artifacts + email)
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
@@ -33,13 +33,20 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO:   ${{ secrets.MAIL_TO }}
           EMAIL_DISABLE: "0"
-          LOCK_TO_EQUITY_CLOSE: "1"  # anchor to last full equity close if run pre-open
-          TRACKER_DEBUG: "1"
+
+          # tracker knobs
+          TRACKER_DEBUG: "0"
+          NOTIONAL_CAPITAL: "100000"
+          BASELINE_DATE: ""              # empty => baseline set on first run (latest bar)
+          LOCKUP_DAYS: "365"             # calendar days
+          ENFORCE_LOCKUP: "1"
+          ALWAYS_ALERT_ON_BREACH: "0"    # 1 => email every day breaches exist
+
         run: |
           set -e
           python tracker.py daily || (echo "retrying daily..." && sleep 5 && python tracker.py daily)
 
-      - name: Force daily recap email (call weekly)
+      - name: Weekly recap email (optional)
         if: always()
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -49,8 +56,12 @@ jobs:
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO:   ${{ secrets.MAIL_TO }}
           EMAIL_DISABLE: "0"
-          LOCK_TO_EQUITY_CLOSE: "1"
-          TRACKER_DEBUG: "1"
+
+          TRACKER_DEBUG: "0"
+          NOTIONAL_CAPITAL: "100000"
+          BASELINE_DATE: ""
+          LOCKUP_DAYS: "365"
+          ENFORCE_LOCKUP: "1"
         run: |
           set -e
           python tracker.py weekly || (echo "retrying weekly..." && sleep 5 && python tracker.py weekly)
@@ -60,6 +71,6 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add history.csv status.json signals_state.json baseline.json || true
+          git add history.csv status.json signals_state.json baseline.json rebalance_state.json || true
           git commit -m "daily update" || echo "no changes"
           git push || true
