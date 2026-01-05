@@ -1,6 +1,6 @@
-ticker,target_w,band_lo,band_hi
-TQQQ,0.30,0.19,0.37
-GLD,0.20,0.0,1
-XLP,0.20,0.0,1
-DBMF,0.20,0.0,1
-BTC-USD,0.10,0.045,0.36
+symbol,yf_ticker,target_w,band_down,band_up
+QQQSIM?L=3,TQQQ,0.3,0,0
+DBMFSIM,DBMF,0.25,0,0
+XLESIM,XLE,0.15,0.1,0.05
+GLDSIM,GLD,0.15,0.1,0.05
+CASHX.1,SGOV,0.15,0,0
