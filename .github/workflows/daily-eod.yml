@@ -2,7 +2,7 @@ name: daily-eod
 
 on:
   schedule:
-    - cron: '10 21 * * 1-5'   # weekdays @ 21:10 UTC (close-ish; DST shifts vs ET)
+    - cron: '10 21 * * 1-5'   # weekdays @ 21:10 UTC
   workflow_dispatch:
 
 permissions:
@@ -34,19 +34,19 @@ jobs:
           MAIL_TO:   ${{ secrets.MAIL_TO }}
           EMAIL_DISABLE: "0"
 
-          # tracker knobs
+          # tracker knobs (match your script)
           TRACKER_DEBUG: "0"
-          NOTIONAL_CAPITAL: "100000"
-          BASELINE_DATE: ""              # empty => baseline set on first run (latest bar)
-          LOCKUP_DAYS: "365"             # calendar days
+          START_CAPITAL: "100000"
+          LOCKUP_DAYS: "365"
           ENFORCE_LOCKUP: "1"
-          ALWAYS_ALERT_ON_BREACH: "0"    # 1 => email every day breaches exist
-
+          ALWAYS_ALERT_ON_BREACH: "0"
+          AUTO_REBALANCE: "0"
+          MONTHLY_CONTRIBUTION: "2000"
         run: |
           set -e
           python tracker.py daily || (echo "retrying daily..." && sleep 5 && python tracker.py daily)
 
-      - name: Weekly recap email (optional)
+      - name: Weekly recap email (Fridays only, UTC)
         if: always()
         env:
           SMTP_HOST: ${{ secrets.SMTP_HOST }}
@@ -58,19 +58,26 @@ jobs:
           EMAIL_DISABLE: "0"
 
           TRACKER_DEBUG: "0"
-          NOTIONAL_CAPITAL: "100000"
-          BASELINE_DATE: ""
+          START_CAPITAL: "100000"
           LOCKUP_DAYS: "365"
           ENFORCE_LOCKUP: "1"
+          ALWAYS_ALERT_ON_BREACH: "0"
+          AUTO_REBALANCE: "0"
+          MONTHLY_CONTRIBUTION: "2000"
         run: |
           set -e
-          python tracker.py weekly || (echo "retrying weekly..." && sleep 5 && python tracker.py weekly)
+          if [ "$(date -u +%u)" -eq 5 ]; then
+            python tracker.py weekly || (echo "retrying weekly..." && sleep 5 && python tracker.py weekly)
+          else
+            echo "Not Friday UTC; skipping weekly."
+          fi
 
       - name: Commit artifacts
         if: always()
         run: |
+          set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add history.csv status.json signals_state.json baseline.json rebalance_state.json || true
+          git add history.csv status.json signals_state.json rebalance_state.json holdings_state.json || true
           git commit -m "daily update" || echo "no changes"
           git push || true
