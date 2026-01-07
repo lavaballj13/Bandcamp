@@ -1,26 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+
 """
 GitHub Actions Portfolio Tracker (bands + lockup + optional auto-rebalance + email)
-HARDCODED PORTFOLIO (no portfolio.csv needed)
+HARD-CODED PORTFOLIO (no portfolio.csv needed)
 
-Key behavior:
-- Prices come from yfinance using yf_ticker (e.g., TQQQ, DBMF, XLE, GLD, SGOV)
-- Reporting/alerts use your internal symbol names (e.g., QQQSIM?L=3)
-- Tracks synthetic fractional shares persisted in holdings_state.json
-- Band breaches are evaluated on current weights vs target +/- (band_down, band_up)
-- Lockup is CALENDAR DAYS (date difference in days)
-- Optional AUTO_REBALANCE=1:
-    If breach exists and not in lockup, rebalance to targets and set lockup_until.
-
-Artifacts:
-- holdings_state.json
-- rebalance_state.json
-- status.json
-- history.csv
-- signals_state.json
-
-Deps: pandas numpy yfinance
+Fixes vs your original:
+- Python 3.9+ compatible type hints (no PEP604 `|` unions)
+- Robust env parsing for SMTP_PORT (handles empty string)
+- Correct 1d ROC when re-running on same as_of date (uses prior distinct date)
+- Single-ticker price extraction uses last non-NaN (avoids NaN crash)
 """
 
 from __future__ import annotations
@@ -36,7 +25,7 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -57,7 +46,7 @@ PORT = pd.DataFrame(
     ]
 ).copy()
 
-# normalize targets defensively (should already sum to 1)
+# Defensive normalization (should already sum to 1)
 PORT["target_w"] = pd.to_numeric(PORT["target_w"], errors="coerce").fillna(0.0)
 s = float(PORT["target_w"].sum())
 if s <= 0:
@@ -71,20 +60,38 @@ PORT = PORT.reset_index(drop=True)
 
 
 # ==========================
-# ENV CONFIG
+# ENV CONFIG (set in GitHub Actions env:)
 # ==========================
-START_CAPITAL = float(os.getenv("START_CAPITAL", "100000.0"))
+def _env_float(name: str, default: str) -> float:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return float(default)
+    return float(v)
 
-TAX_LOCKUP_DAYS = int(os.getenv("TAX_LOCKUP_DAYS", "365"))
-ENFORCE_LOCKUP = (os.getenv("ENFORCE_LOCKUP", "1") == "1")
 
-AUTO_REBALANCE = (os.getenv("AUTO_REBALANCE", "0") == "1")
+def _env_int(name: str, default: str) -> int:
+    v = os.getenv(name)
+    if v is None or str(v).strip() == "":
+        return int(default)
+    return int(v)
 
-ALWAYS_ALERT_ON_BREACH = (os.getenv("ALWAYS_ALERT_ON_BREACH", "0") == "1")
 
-MONTHLY_CONTRIBUTION = float(os.getenv("MONTHLY_CONTRIBUTION", "2000.0"))
+def _env_bool(name: str, default: str = "0") -> bool:
+    v = os.getenv(name, default)
+    return str(v).strip() == "1"
 
-DBG = (os.getenv("TRACKER_DEBUG", "0") == "1")
+
+START_CAPITAL = _env_float("START_CAPITAL", "100000.0")
+
+LOCKUP_DAYS = _env_int("LOCKUP_DAYS", os.getenv("TAX_LOCKUP_DAYS", "365"))
+ENFORCE_LOCKUP = _env_bool("ENFORCE_LOCKUP", "1")
+
+AUTO_REBALANCE = _env_bool("AUTO_REBALANCE", "0")
+ALWAYS_ALERT_ON_BREACH = _env_bool("ALWAYS_ALERT_ON_BREACH", "0")
+
+MONTHLY_CONTRIBUTION = _env_float("MONTHLY_CONTRIBUTION", "2000.0")
+
+DBG = _env_bool("TRACKER_DEBUG", "0")
 
 EPS = 1e-12
 
@@ -103,12 +110,12 @@ SIGNALS_JSON = "signals_state.json"
 # EMAIL (GitHub Secrets)
 # ==========================
 SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_PORT = _env_int("SMTP_PORT", "587")  # robust (handles empty string)
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 MAIL_FROM = os.getenv("MAIL_FROM")
 MAIL_TO = os.getenv("MAIL_TO")
-EMAIL_DISABLE = (os.getenv("EMAIL_DISABLE", "0") == "1")
+EMAIL_DISABLE = _env_bool("EMAIL_DISABLE", "0")
 
 
 # ==========================
@@ -139,16 +146,17 @@ def load_json(path: str) -> dict:
     if not p.exists():
         return {}
     try:
-        return json.loads(p.read_text())
-    except Exception:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception as e:
+        _warn(f"{path} unreadable; treating as empty. err={repr(e)}")
         return {}
 
 
 def save_json(path: str, obj: dict) -> None:
-    Path(path).write_text(json.dumps(obj, indent=2))
+    Path(path).write_text(json.dumps(obj, indent=2), encoding="utf-8")
 
 
-def _parse_date(s: str | None) -> date | None:
+def _parse_date(s: Optional[str]) -> Optional[date]:
     if not s:
         return None
     try:
@@ -160,12 +168,15 @@ def _parse_date(s: str | None) -> date | None:
 # ==========================
 # EMAIL
 # ==========================
-def email_send(subject: str, body: str, attachments: List[Tuple[str, pd.DataFrame]] | None = None) -> None:
+def email_send(subject: str, body: str, attachments: Optional[List[Tuple[str, pd.DataFrame]]] = None) -> None:
     if EMAIL_DISABLE:
         _warn("EMAIL_DISABLE=1 → skipping email send")
         return
+
+    # This is the most common reason for "no email" while workflow "succeeds"
     if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM, MAIL_TO]):
-        _warn("Email not configured; set SMTP_* and MAIL_* secrets.")
+        _warn("Email not configured (missing SMTP_* or MAIL_*).")
+        _warn(f"SMTP_HOST set? {bool(SMTP_HOST)}  SMTP_USER set? {bool(SMTP_USER)}  MAIL_TO set? {bool(MAIL_TO)}")
         return
 
     try:
@@ -177,7 +188,10 @@ def email_send(subject: str, body: str, attachments: List[Tuple[str, pd.DataFram
 
         for name, df in (attachments or []):
             buf = io.StringIO()
-            df.to_csv(buf, index=False)
+            if isinstance(df, pd.DataFrame) and len(df) > 0:
+                df.to_csv(buf, index=False)
+            else:
+                buf.write("")  # attach empty file rather than crashing
             msg.add_attachment(
                 buf.getvalue().encode("utf-8"),
                 maintype="text",
@@ -197,9 +211,9 @@ def email_send(subject: str, body: str, attachments: List[Tuple[str, pd.DataFram
 
 
 # ==========================
-# yfinance
+# yfinance (robust-ish)
 # ==========================
-def _yf_download(tickers: List[str], period="10d", interval="1d", tries=3) -> pd.DataFrame:
+def _yf_download(tickers: List[str], period: str = "30d", interval: str = "1d", tries: int = 3) -> pd.DataFrame:
     last_err = None
     for k in range(tries):
         try:
@@ -225,12 +239,14 @@ def _get_field_frame(frame: pd.DataFrame, field: str) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame) or len(frame) == 0:
         raise KeyError("empty frame")
     if isinstance(frame.columns, pd.MultiIndex):
-        if field in frame.columns.get_level_values(0):
+        fields = set(frame.columns.get_level_values(0))
+        if field in fields:
             return frame[field]
-        if field == "Adj Close" and "Close" in frame.columns.get_level_values(0):
+        # fallback
+        if field == "Adj Close" and "Close" in fields:
             _warn("Adj Close missing; using Close as fallback")
             return frame["Close"]
-        raise KeyError(f"{field} not found in fields: {sorted(set(frame.columns.get_level_values(0)))}")
+        raise KeyError(f"{field} not found in fields: {sorted(fields)}")
     else:
         if field in frame.columns:
             return frame[[field]]
@@ -240,18 +256,34 @@ def _get_field_frame(frame: pd.DataFrame, field: str) -> pd.DataFrame:
         raise KeyError(f"{field} not found in columns: {frame.columns.tolist()}")
 
 
-def _last_row_series(frame: pd.DataFrame, field: str, tickers: List[str]) -> pd.Series:
-    try:
-        sub = _get_field_frame(frame, field)
-    except Exception:
-        return pd.Series({t: np.nan for t in tickers}, dtype="float64")
+def _last_non_nan_prices(frame: pd.DataFrame, field: str, tickers: List[str]) -> Tuple[pd.Timestamp, pd.Series]:
+    """
+    Returns:
+      - as_of_dt: timestamp of the last available bar (index)
+      - prices: Series indexed by tickers, last non-nan per ticker.
+    """
+    if not isinstance(frame, pd.DataFrame) or len(frame) == 0 or not isinstance(frame.index, pd.DatetimeIndex):
+        raise RuntimeError("Invalid yfinance frame (empty or missing DatetimeIndex).")
 
+    as_of_dt = pd.Timestamp(frame.index[-1]).tz_localize(None)
+    sub = _get_field_frame(frame, field)
+
+    # Multi ticker: sub is DataFrame with columns tickers
     if isinstance(frame.columns, pd.MultiIndex):
-        s = sub.iloc[-1]
-        s.index = s.index.astype(str)
-        return pd.Series(s, dtype="float64").reindex(tickers)
-    else:
-        return pd.Series({tickers[0]: float(sub.iloc[-1, 0])}, dtype="float64")
+        prices: Dict[str, float] = {}
+        for t in tickers:
+            if t in sub.columns:
+                col = sub[t]
+                vv = col.dropna()
+                prices[t] = float(vv.iloc[-1]) if len(vv) > 0 else np.nan
+            else:
+                prices[t] = np.nan
+        return as_of_dt, pd.Series(prices, dtype="float64").reindex(tickers)
+
+    # Single ticker case: use last non-NaN (not necessarily last row)
+    vv = sub.iloc[:, 0].dropna()
+    v = float(vv.iloc[-1]) if len(vv) > 0 else np.nan
+    return as_of_dt, pd.Series({tickers[0]: v}, dtype="float64")
 
 
 # ==========================
@@ -265,17 +297,19 @@ def set_rebalance_state(*, last_rebalance_date: date, lockup_until: date, reason
     st = {
         "last_rebalance_date": last_rebalance_date.isoformat(),
         "lockup_until": lockup_until.isoformat(),
-        "tax_lockup_days": int(TAX_LOCKUP_DAYS),
+        "lockup_days": int(LOCKUP_DAYS),
+        "lockup_enforced": bool(ENFORCE_LOCKUP),
         "reason": str(reason),
     }
     save_json(REBAL_JSON, st)
 
 
-def lockup_status(as_of: date) -> Tuple[bool, date | None]:
+def lockup_status(as_of: date) -> Tuple[bool, Optional[date]]:
     st = load_rebalance_state()
     until = _parse_date(st.get("lockup_until"))
     if not ENFORCE_LOCKUP or until is None:
         return (False, until)
+    # locked strictly BEFORE until date (anniversary day is allowed)
     return (as_of < until, until)
 
 
@@ -290,13 +324,18 @@ def save_holdings(holdings: dict) -> None:
     save_json(HOLDINGS_JSON, holdings)
 
 
-def ensure_holdings_initialized(port: pd.DataFrame, last_close_by_yf: pd.Series, as_of: date) -> dict:
+def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_of: date) -> dict:
+    """
+    On first run: create synthetic shares matching target weights, using START_CAPITAL.
+    Also initializes rebalance_state.json (so email always has lock info fields).
+    """
     h = load_holdings()
-    if h.get("shares") and isinstance(h["shares"], dict) and len(h["shares"]) > 0:
+    if isinstance(h.get("shares"), dict) and len(h["shares"]) > 0:
         return h
 
     tickers = port["yf_ticker"].tolist()
-    px = last_close_by_yf.reindex(tickers).astype(float)
+    px = close_by_yf.reindex(tickers).astype(float)
+
     if px.isna().any() or (px <= 0).any():
         bad = px[px.isna() | (px <= 0)]
         raise RuntimeError(f"Cannot initialize holdings; bad prices: {bad.to_dict()}")
@@ -304,7 +343,7 @@ def ensure_holdings_initialized(port: pd.DataFrame, last_close_by_yf: pd.Series,
     total = float(START_CAPITAL)
     tgt = port["target_w"].to_numpy(float)
 
-    shares = {}
+    shares: Dict[str, float] = {}
     for yf_t, w, p in zip(tickers, tgt, px.to_numpy(float)):
         dollars = total * float(w)
         shares[yf_t] = float(dollars / float(p))
@@ -316,28 +355,37 @@ def ensure_holdings_initialized(port: pd.DataFrame, last_close_by_yf: pd.Series,
     }
     save_holdings(h)
     _info("Initialized holdings_state.json using START_CAPITAL =", START_CAPITAL)
+
+    # Initialize rebalance state if missing (clean reporting)
+    if not Path(REBAL_JSON).exists():
+        set_rebalance_state(
+            last_rebalance_date=as_of,
+            lockup_until=as_of,  # not locked
+            reason="init",
+        )
     return h
 
 
 # ==========================
-# COMPUTE allocation (report by symbol)
+# COMPUTE allocation
 # ==========================
 @dataclass
 class AllocationSnapshot:
     as_of: date
     total_value: float
-    table: pd.DataFrame  # rows by symbol/yf_ticker
+    table: pd.DataFrame
 
 
-def compute_allocation(port: pd.DataFrame, shares_by_yf: Dict[str, float], last_close_by_yf: pd.Series, as_of: date) -> AllocationSnapshot:
+def compute_allocation(port: pd.DataFrame, shares_by_yf: Dict[str, float], close_by_yf: pd.Series, as_of: date) -> AllocationSnapshot:
     df = port.copy()
     df["shares"] = df["yf_ticker"].map(lambda t: float(shares_by_yf.get(t, 0.0)))
-    df["price"] = df["yf_ticker"].map(lambda t: float(last_close_by_yf.get(t, np.nan)))
+    df["price"] = df["yf_ticker"].map(lambda t: float(close_by_yf.get(t, np.nan)))
+
     df["value"] = df["shares"] * df["price"]
     df["value"] = df["value"].replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
     total = float(df["value"].sum())
-    df["weight_now"] = df["value"] / total if total > 0 else 0.0
+    df["weight_now"] = (df["value"] / total) if total > 0 else 0.0
 
     df["lo"] = (df["target_w"] - df["band_down"]).clip(lower=0.0)
     df["hi"] = (df["target_w"] + df["band_up"]).clip(upper=1.0)
@@ -365,9 +413,10 @@ def compute_allocation(port: pd.DataFrame, shares_by_yf: Dict[str, float], last_
 # ==========================
 # REBALANCE execution (synthetic)
 # ==========================
-def rebalance_to_targets(port: pd.DataFrame, last_close_by_yf: pd.Series, total_value: float) -> Dict[str, float]:
+def rebalance_to_targets(port: pd.DataFrame, close_by_yf: pd.Series, total_value: float) -> Dict[str, float]:
     tickers = port["yf_ticker"].tolist()
-    px = last_close_by_yf.reindex(tickers).astype(float)
+    px = close_by_yf.reindex(tickers).astype(float)
+
     if px.isna().any() or (px <= 0).any():
         bad = px[px.isna() | (px <= 0)]
         raise RuntimeError(f"Cannot rebalance; bad prices: {bad.to_dict()}")
@@ -381,7 +430,7 @@ def rebalance_to_targets(port: pd.DataFrame, last_close_by_yf: pd.Series, total_
 
 
 # ==========================
-# SIGNAL state
+# SIGNALS STATE (with first_seen/last_seen)
 # ==========================
 def load_signals_state() -> dict:
     return load_json(SIGNALS_JSON)
@@ -399,8 +448,34 @@ def current_signal_map(tbl: pd.DataFrame) -> dict:
     return out
 
 
+def update_signal_timestamps(prev_state: dict, now_signals: dict, as_of: date) -> dict:
+    """
+    prev_state schema:
+      {
+        "as_of": "...",
+        "signals": {sym: "LOW/HIGH", ...},
+        "first_seen": {sym: "YYYY-MM-DD", ...},
+        "last_seen": {sym: "YYYY-MM-DD", ...}
+      }
+    """
+    first_seen = dict(prev_state.get("first_seen", {}) or {})
+    last_seen = dict(prev_state.get("last_seen", {}) or {})
+
+    for sym in now_signals.keys():
+        if sym not in first_seen:
+            first_seen[sym] = as_of.isoformat()
+        last_seen[sym] = as_of.isoformat()
+
+    return {
+        "as_of": as_of.isoformat(),
+        "signals": now_signals,
+        "first_seen": first_seen,
+        "last_seen": last_seen,
+    }
+
+
 # ==========================
-# HISTORY
+# HISTORY (idempotent per date)
 # ==========================
 def _collapse_history_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
@@ -413,10 +488,14 @@ def _collapse_history_df(df: pd.DataFrame) -> pd.DataFrame:
     return g
 
 
-def update_history(as_of: date, total_value: float, roc_1d: float) -> None:
-    cols = ["date", "total_value", "roc_1d"]
+def update_history(as_of: date, total_value: float) -> float:
+    """
+    Write/Upsert today's history row. Return roc_1d based on prior DISTINCT date in file.
+    (Fixes rerun-on-same-date returning ~0 or nonsense.)
+    """
+    cols = ["date", "total_value"]
     day = as_of.isoformat()
-    new_row = pd.DataFrame([{"date": day, "total_value": float(total_value), "roc_1d": float(roc_1d)}], columns=cols)
+    new_row = pd.DataFrame([{"date": day, "total_value": float(total_value)}], columns=cols)
 
     path = Path(HISTORY_CSV)
     if path.exists():
@@ -424,20 +503,30 @@ def update_history(as_of: date, total_value: float, roc_1d: float) -> None:
             df = pd.read_csv(path, parse_dates=["date"])
         except Exception:
             df = pd.DataFrame(columns=cols)
+
         df = _collapse_history_df(df)
-        if len(df):
-            df = df[df["date"].dt.date.astype(str) != day]
-        df = pd.concat([df, new_row], ignore_index=True)
+
+        # remove today's row first, then take previous day's value
+        df_wo_today = df[df["date"].dt.date.astype(str) != day].sort_values("date")
+        prev_val = float(df_wo_today["total_value"].iloc[-1]) if len(df_wo_today) > 0 else np.nan
+
+        df = pd.concat([df_wo_today, new_row], ignore_index=True)
     else:
         df = new_row
+        prev_val = np.nan
 
     df = df.sort_values("date")
     df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
     df.to_csv(path, index=False)
 
+    roc_1d = 0.0
+    if np.isfinite(prev_val) and prev_val > 0:
+        roc_1d = float(total_value / prev_val - 1.0)
+    return float(roc_1d)
+
 
 # ==========================
-# Formatting / contribution
+# Formatting helpers
 # ==========================
 def fmt_pct(x: float) -> str:
     return f"{x*100:6.2f}%"
@@ -445,7 +534,7 @@ def fmt_pct(x: float) -> str:
 
 def format_alloc_table(tbl: pd.DataFrame) -> str:
     lines = []
-    lines.append(f"{'Symbol':<12} {'YF':<6} {'Now':>9} {'Target':>9} {'Band':>17} {'Status':>8} {'$Value':>14}")
+    lines.append(f"{'Symbol':<12} {'YF':<6} {'Now':>9} {'Target':>9} {'Band':>19} {'Status':>8} {'$Value':>14}")
     for _, r in tbl.iterrows():
         sym = str(r["symbol"])
         yf = str(r["yf_ticker"])
@@ -456,14 +545,14 @@ def format_alloc_table(tbl: pd.DataFrame) -> str:
         if bd <= 0 and bu <= 0:
             band = "—"
         else:
-            band = f"[{fmt_pct(float(r['lo']))}..{fmt_pct(float(r['hi']))}]"
+            band = f"[{r['lo']*100:5.2f}%..{r['hi']*100:5.2f}%]"
         st = str(r["status"])
         v = float(r["value"])
-        lines.append(f"{sym:<12} {yf:<6} {now:>9} {tgt:>9} {band:>17} {st:>8} {v:>14,.2f}")
+        lines.append(f"{sym:<12} {yf:<6} {now:>9} {tgt:>9} {band:>19} {st:>8} {v:>14,.2f}")
     return "\n".join(lines)
 
 
-def format_rebalance_deltas(tbl: pd.DataFrame) -> pd.DataFrame:
+def rebalance_deltas(tbl: pd.DataFrame) -> pd.DataFrame:
     total = float(tbl["value"].sum())
     df = tbl.copy()
     df["target_$"] = df["target_w"] * total
@@ -474,6 +563,10 @@ def format_rebalance_deltas(tbl: pd.DataFrame) -> pd.DataFrame:
 
 
 def suggest_contribution_split(tbl: pd.DataFrame, contribution: float) -> pd.DataFrame:
+    """
+    Allocate contribution dollars to underweights proportionally to deficit (target - current).
+    If nothing is underweight, allocate by target weights.
+    """
     df = tbl.copy()
     df["deficit"] = np.maximum(0.0, df["target_w"] - df["weight_now"])
 
@@ -483,7 +576,6 @@ def suggest_contribution_split(tbl: pd.DataFrame, contribution: float) -> pd.Dat
 
     d = df["deficit"].to_numpy(float)
     if float(d.sum()) <= 1e-12:
-        # no underweights, fall back to target
         w = df["target_w"].to_numpy(float)
         w = w / max(EPS, float(w.sum()))
     else:
@@ -498,42 +590,38 @@ def suggest_contribution_split(tbl: pd.DataFrame, contribution: float) -> pd.Dat
 # ==========================
 def daily_job() -> None:
     yf_tickers = PORT["yf_ticker"].tolist()
-    data = _yf_download(yf_tickers, period="10d", interval="1d", tries=3)
 
+    # Pull enough history to survive NaNs / missing latest
+    data = _yf_download(yf_tickers, period="45d", interval="1d", tries=3)
     if not isinstance(data, pd.DataFrame) or len(data) == 0 or not isinstance(data.index, pd.DatetimeIndex):
-        raise RuntimeError("yfinance returned no data; cannot run daily job.")
+        raise RuntimeError("yfinance returned no usable data; cannot run daily job.")
 
-    as_of_dt = pd.Timestamp(data.index[-1]).tz_localize(None)
+    as_of_dt, close_by_yf = _last_non_nan_prices(data, "Close", yf_tickers)
     as_of = as_of_dt.date()
 
-    last_close_by_yf = _last_row_series(data, "Close", yf_tickers)
-    if last_close_by_yf.isna().any():
-        bad = last_close_by_yf[last_close_by_yf.isna()]
+    if close_by_yf.isna().any():
+        bad = close_by_yf[close_by_yf.isna()]
         raise RuntimeError(f"Missing Close prices for: {bad.index.tolist()}")
 
-    holdings = ensure_holdings_initialized(PORT, last_close_by_yf, as_of)
-    shares_by_yf = holdings.get("shares", {})
+    holdings = ensure_holdings_initialized(PORT, close_by_yf, as_of)
+    shares_by_yf = holdings.get("shares", {}) or {}
 
-    snap = compute_allocation(PORT, shares_by_yf, last_close_by_yf, as_of)
+    snap = compute_allocation(PORT, shares_by_yf, close_by_yf, as_of)
 
-    # 1-day ROC from history
-    roc_1d = 0.0
-    if Path(HISTORY_CSV).exists():
-        try:
-            hist = pd.read_csv(HISTORY_CSV)
-            if len(hist) >= 1:
-                prev_val = float(hist["total_value"].iloc[-1])
-                roc_1d = (snap.total_value / prev_val - 1.0) if prev_val > 0 else 0.0
-        except Exception:
-            roc_1d = 0.0
+    roc_1d = update_history(as_of, snap.total_value)
 
-    update_history(as_of, snap.total_value, roc_1d)
-
+    # Signals
     sig_now = current_signal_map(snap.table)
-    sig_prev = load_signals_state()
-    changed = (sig_now != sig_prev)
-    save_signals_state(sig_now)
 
+    prev_sig_state = load_signals_state()
+    prev_sig_map = dict(prev_sig_state.get("signals", {}) or {})
+    changed = (sig_now != prev_sig_map)
+
+    # Always update timestamps even if unchanged (keeps last_seen current)
+    new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
+    save_signals_state(new_sig_state)
+
+    # Lockup state
     in_lock, lock_until = lockup_status(as_of)
     reb_state = load_rebalance_state()
     last_reb = _parse_date(reb_state.get("last_rebalance_date"))
@@ -541,16 +629,18 @@ def daily_job() -> None:
     did_rebalance = False
     reb_msg = ""
 
-    if len(sig_now) > 0 and AUTO_REBALANCE:
+    # Auto rebalance only if breach exists
+    if sig_now and AUTO_REBALANCE:
         if ENFORCE_LOCKUP and in_lock:
-            reb_msg = f"Auto-rebalance BLOCKED by lockup (until {lock_until})."
+            reb_msg = f"Auto-rebalance BLOCKED by lockup (until {lock_until.isoformat() if lock_until else '—'})."
         else:
-            new_shares = rebalance_to_targets(PORT, last_close_by_yf, snap.total_value)
+            new_shares = rebalance_to_targets(PORT, close_by_yf, snap.total_value)
+
             holdings["shares"] = new_shares
             holdings["as_of"] = as_of.isoformat()
             save_holdings(holdings)
 
-            until = as_of + timedelta(days=int(TAX_LOCKUP_DAYS)) if ENFORCE_LOCKUP else as_of
+            until = as_of + timedelta(days=int(LOCKUP_DAYS)) if ENFORCE_LOCKUP else as_of
             set_rebalance_state(
                 last_rebalance_date=as_of,
                 lockup_until=until,
@@ -558,43 +648,53 @@ def daily_job() -> None:
             )
 
             did_rebalance = True
-            reb_msg = f"Auto-rebalance EXECUTED. Lockup until {until}."
+            reb_msg = f"Auto-rebalance EXECUTED. Lockup until {until.isoformat()}."
 
-            # recompute post-rebalance snapshot
-            snap = compute_allocation(PORT, new_shares, last_close_by_yf, as_of)
+            # Recompute after rebalance
+            snap = compute_allocation(PORT, new_shares, close_by_yf, as_of)
             sig_now = current_signal_map(snap.table)
+
             in_lock, lock_until = lockup_status(as_of)
             reb_state = load_rebalance_state()
             last_reb = _parse_date(reb_state.get("last_rebalance_date"))
 
-    elif len(sig_now) > 0 and not AUTO_REBALANCE:
+            # Update signals timestamps again post-rebalance
+            prev_sig_state = load_signals_state()
+            new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
+            save_signals_state(new_sig_state)
+
+    elif sig_now and not AUTO_REBALANCE:
         reb_msg = "Auto-rebalance OFF (AUTO_REBALANCE=0)."
 
-    # status.json
+    # status.json (single source of truth snapshot)
     status = {
         "as_of": as_of.isoformat(),
+        "as_of_timestamp": str(as_of_dt),
         "total_value": float(snap.total_value),
         "roc_1d": float(roc_1d),
         "last_rebalance_date": (last_reb.isoformat() if last_reb else None),
-        "lockup_days": int(TAX_LOCKUP_DAYS),
+        "lockup_days": int(LOCKUP_DAYS),
         "lockup_enforced": bool(ENFORCE_LOCKUP),
         "lockup_until": (lock_until.isoformat() if lock_until else None),
         "in_lockup": bool(in_lock),
         "auto_rebalance": bool(AUTO_REBALANCE),
         "auto_rebalance_executed_today": bool(did_rebalance),
         "signals": sig_now,
+        "signals_first_seen": new_sig_state.get("first_seen", {}),
+        "signals_last_seen": new_sig_state.get("last_seen", {}),
         "portfolio": PORT.to_dict(orient="records"),
         "allocation": snap.table.to_dict(orient="records"),
     }
-    Path(STATUS_JSON).write_text(json.dumps(status, indent=2))
+    Path(STATUS_JSON).write_text(json.dumps(status, indent=2), encoding="utf-8")
 
-    breaches_exist = (len(sig_now) > 0)
+    breaches_exist = bool(sig_now)
     should_email = breaches_exist and (ALWAYS_ALERT_ON_BREACH or changed or did_rebalance)
 
+    # Email body (includes lockup and breach timestamps)
     header = [
         f"As of: {as_of.isoformat()} (EOD Close)",
         f"Total value: ${snap.total_value:,.2f}   1d ROC: {roc_1d*100:+.2f}%",
-        f"Lockup: {'ON' if ENFORCE_LOCKUP else 'OFF'} ({TAX_LOCKUP_DAYS} calendar days)",
+        f"Lockup: {'ON' if ENFORCE_LOCKUP else 'OFF'} ({LOCKUP_DAYS} calendar days)",
         f"Last rebalance: {last_reb.isoformat() if last_reb else '—'}",
         f"Locked until: {lock_until.isoformat() if lock_until else '—'}  (in_lockup={in_lock})",
         f"Auto-rebalance: {'ON' if AUTO_REBALANCE else 'OFF'}",
@@ -610,13 +710,18 @@ def daily_job() -> None:
         body += "⚠️ Band Breaches:\n"
         for sym, st in sig_now.items():
             r = snap.table[snap.table["symbol"] == sym].iloc[0]
+            first_seen = new_sig_state.get("first_seen", {}).get(sym, "—")
+            last_seen = new_sig_state.get("last_seen", {}).get(sym, "—")
             body += (
-                f"- {sym} ({r['yf_ticker']}): {st}  now={r['weight_now']*100:.2f}% "
-                f"band=[{r['lo']*100:.2f}%..{r['hi']*100:.2f}%] target={r['target_w']*100:.2f}%\n"
+                f"- {sym} ({r['yf_ticker']}): {st}  "
+                f"now={r['weight_now']*100:.2f}%  "
+                f"band=[{r['lo']*100:.2f}%..{r['hi']*100:.2f}%]  "
+                f"target={r['target_w']*100:.2f}%  "
+                f"(first_seen={first_seen}, last_seen={last_seen})\n"
             )
         body += "\n"
 
-    reb_df = format_rebalance_deltas(snap.table)
+    reb_df = rebalance_deltas(snap.table)
     contrib_df = suggest_contribution_split(snap.table, MONTHLY_CONTRIBUTION)
 
     if should_email:
@@ -629,11 +734,11 @@ def daily_job() -> None:
             attachments=[
                 ("allocation.csv", snap.table),
                 ("rebalance_to_target_deltas.csv", reb_df),
-                ("contribution_split_$2000.csv", contrib_df),
+                (f"contribution_split_${int(MONTHLY_CONTRIBUTION)}.csv", contrib_df),
             ],
         )
     else:
-        _info("No email sent (no breaches or unchanged, and no auto-rebalance).")
+        _info("No email sent (no breaches OR unchanged and no auto-rebalance).")
 
 
 # ==========================
@@ -641,37 +746,35 @@ def daily_job() -> None:
 # ==========================
 def weekly_job() -> None:
     yf_tickers = PORT["yf_ticker"].tolist()
-    data = _yf_download(yf_tickers, period="30d", interval="1d", tries=3)
+    data = _yf_download(yf_tickers, period="180d", interval="1d", tries=3)
 
     if not isinstance(data, pd.DataFrame) or len(data) == 0 or not isinstance(data.index, pd.DatetimeIndex):
-        raise RuntimeError("yfinance returned no data; cannot run weekly job.")
+        raise RuntimeError("yfinance returned no usable data; cannot run weekly job.")
 
-    as_of_dt = pd.Timestamp(data.index[-1]).tz_localize(None)
+    as_of_dt, close_by_yf = _last_non_nan_prices(data, "Close", yf_tickers)
     as_of = as_of_dt.date()
 
-    last_close_by_yf = _last_row_series(data, "Close", yf_tickers)
-    if last_close_by_yf.isna().any():
-        bad = last_close_by_yf[last_close_by_yf.isna()]
+    if close_by_yf.isna().any():
+        bad = close_by_yf[close_by_yf.isna()]
         raise RuntimeError(f"Missing Close prices for: {bad.index.tolist()}")
 
-    holdings = ensure_holdings_initialized(PORT, last_close_by_yf, as_of)
-    shares_by_yf = holdings.get("shares", {})
+    holdings = ensure_holdings_initialized(PORT, close_by_yf, as_of)
+    shares_by_yf = holdings.get("shares", {}) or {}
 
-    snap = compute_allocation(PORT, shares_by_yf, last_close_by_yf, as_of)
+    snap = compute_allocation(PORT, shares_by_yf, close_by_yf, as_of)
 
     in_lock, lock_until = lockup_status(as_of)
     reb_state = load_rebalance_state()
     last_reb = _parse_date(reb_state.get("last_rebalance_date"))
 
-    # performance from history.csv
+    # Performance from history.csv
     ret_5d = np.nan
     ret_mtd = np.nan
     ret_ytd = np.nan
     if Path(HISTORY_CSV).exists():
         try:
-            hist = pd.read_csv(HISTORY_CSV)
-            hist["date"] = pd.to_datetime(hist["date"])
-            hist = hist.sort_values("date")
+            hist = pd.read_csv(HISTORY_CSV, parse_dates=["date"])
+            hist = _collapse_history_df(hist).sort_values("date")
             if len(hist) >= 2:
                 if len(hist) >= 6:
                     v0 = float(hist["total_value"].iloc[-6])
@@ -692,10 +795,15 @@ def weekly_job() -> None:
         except Exception as e:
             _warn("weekly: failed reading history.csv:", repr(e))
 
+    sig_state = load_signals_state()
+    sig_now = dict(sig_state.get("signals", {}) or {})
+    first_seen = dict(sig_state.get("first_seen", {}) or {})
+    last_seen = dict(sig_state.get("last_seen", {}) or {})
+
     header = [
         f"Weekly recap — as of {as_of.isoformat()} (EOD Close)",
         f"Total value: ${snap.total_value:,.2f}",
-        f"Lockup: {'ON' if ENFORCE_LOCKUP else 'OFF'} ({TAX_LOCKUP_DAYS} calendar days)",
+        f"Lockup: {'ON' if ENFORCE_LOCKUP else 'OFF'} ({LOCKUP_DAYS} calendar days)",
         f"Last rebalance: {last_reb.isoformat() if last_reb else '—'}",
         f"Locked until: {lock_until.isoformat() if lock_until else '—'}  (in_lockup={in_lock})",
         f"Auto-rebalance: {'ON' if AUTO_REBALANCE else 'OFF'}",
@@ -708,12 +816,19 @@ def weekly_job() -> None:
     body += format_alloc_table(snap.table) + "\n\n"
 
     body += "Performance (from history.csv total_value):\n"
-    body += f"- ~5d: {ret_5d*100:6.2f}%\n" if np.isfinite(ret_5d) else "- ~5d:   n/a\n"
-    body += f"- MTD: {ret_mtd*100:6.2f}%\n" if np.isfinite(ret_mtd) else "- MTD:  n/a\n"
-    body += f"- YTD: {ret_ytd*100:6.2f}%\n" if np.isfinite(ret_ytd) else "- YTD:  n/a\n"
+    body += (f"- ~5d: {ret_5d*100:6.2f}%\n" if np.isfinite(ret_5d) else "- ~5d:   n/a\n")
+    body += (f"- MTD: {ret_mtd*100:6.2f}%\n" if np.isfinite(ret_mtd) else "- MTD:  n/a\n")
+    body += (f"- YTD: {ret_ytd*100:6.2f}%\n" if np.isfinite(ret_ytd) else "- YTD:  n/a\n")
 
-    reb_df = format_rebalance_deltas(snap.table)
+    if sig_now:
+        body += "\nOpen / recent signals:\n"
+        for sym, st in sig_now.items():
+            body += f"- {sym}: {st} (first_seen={first_seen.get(sym,'—')}, last_seen={last_seen.get(sym,'—')})\n"
+
+    reb_df = rebalance_deltas(snap.table)
     contrib_df = suggest_contribution_split(snap.table, MONTHLY_CONTRIBUTION)
+
+    hist_df = pd.read_csv(HISTORY_CSV) if Path(HISTORY_CSV).exists() else pd.DataFrame()
 
     email_send(
         subject="Portfolio — Weekly recap",
@@ -721,8 +836,8 @@ def weekly_job() -> None:
         attachments=[
             ("allocation.csv", snap.table),
             ("rebalance_to_target_deltas.csv", reb_df),
-            ("contribution_split_$2000.csv", contrib_df),
-            ("history.csv", pd.read_csv(HISTORY_CSV) if Path(HISTORY_CSV).exists() else pd.DataFrame()),
+            (f"contribution_split_${int(MONTHLY_CONTRIBUTION)}.csv", contrib_df),
+            ("history.csv", hist_df),
         ],
     )
 
@@ -735,6 +850,16 @@ def main() -> None:
     if mode not in ("daily", "weekly"):
         print("Usage: python tracker.py [daily|weekly]")
         sys.exit(2)
+
+    if DBG:
+        _dbg(
+            "ENV summary:",
+            f"EMAIL_DISABLE={EMAIL_DISABLE}",
+            f"AUTO_REBALANCE={AUTO_REBALANCE}",
+            f"ENFORCE_LOCKUP={ENFORCE_LOCKUP}",
+            f"LOCKUP_DAYS={LOCKUP_DAYS}",
+            f"ALWAYS_ALERT_ON_BREACH={ALWAYS_ALERT_ON_BREACH}",
+        )
 
     try:
         if mode == "daily":
