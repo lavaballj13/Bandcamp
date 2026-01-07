@@ -5,12 +5,13 @@
 GitHub Actions Portfolio Tracker (bands + lockup + optional auto-rebalance + email)
 HARD-CODED PORTFOLIO (no portfolio.csv needed)
 
-Fixes vs your original:
-- Python 3.9+ compatible type hints (no PEP604 `|` unions)
-- Robust env parsing for SMTP_PORT (handles empty string)
-- Correct 1d ROC when re-running on same as_of date (uses prior distinct date)
-- Single-ticker price extraction uses last non-NaN (avoids NaN crash)
-- HISTORY is hardened: never KeyError on weird/old history.csv schemas
+Robustness features:
+- Python 3.9+ typing (no PEP604 unions)
+- SMTP_PORT parsing handles empty strings
+- yfinance: retries + last non-NaN close per ticker
+- history.csv: schema-hardened (never KeyError on total_value/date)
+- history ROC uses prior distinct date (handles reruns same day)
+- weekly recap gated in workflow; code supports daily/weekly
 """
 
 from __future__ import annotations
@@ -34,9 +35,8 @@ import yfinance as yf
 
 
 # ==========================
-# HARDCODED PORTFOLIO (your CSV baked in)
+# HARDCODED PORTFOLIO
 # ==========================
-# band_down/band_up are DECIMALS (0.10 = 10%)
 PORT = pd.DataFrame(
     [
         {"symbol": "QQQSIM?L=3", "yf_ticker": "TQQQ", "target_w": 0.30, "band_down": 0.00, "band_up": 0.00},
@@ -47,7 +47,6 @@ PORT = pd.DataFrame(
     ]
 ).copy()
 
-# Defensive normalization (should already sum to 1)
 PORT["target_w"] = pd.to_numeric(PORT["target_w"], errors="coerce").fillna(0.0)
 s = float(PORT["target_w"].sum())
 if s <= 0:
@@ -61,7 +60,7 @@ PORT = PORT.reset_index(drop=True)
 
 
 # ==========================
-# ENV CONFIG (set in GitHub Actions env:)
+# ENV
 # ==========================
 def _env_float(name: str, default: str) -> float:
     v = os.getenv(name)
@@ -83,15 +82,11 @@ def _env_bool(name: str, default: str = "0") -> bool:
 
 
 START_CAPITAL = _env_float("START_CAPITAL", "100000.0")
-
 LOCKUP_DAYS = _env_int("LOCKUP_DAYS", os.getenv("TAX_LOCKUP_DAYS", "365"))
 ENFORCE_LOCKUP = _env_bool("ENFORCE_LOCKUP", "1")
-
 AUTO_REBALANCE = _env_bool("AUTO_REBALANCE", "0")
 ALWAYS_ALERT_ON_BREACH = _env_bool("ALWAYS_ALERT_ON_BREACH", "0")
-
 MONTHLY_CONTRIBUTION = _env_float("MONTHLY_CONTRIBUTION", "2000.0")
-
 DBG = _env_bool("TRACKER_DEBUG", "0")
 
 EPS = 1e-12
@@ -108,10 +103,10 @@ SIGNALS_JSON = "signals_state.json"
 
 
 # ==========================
-# EMAIL (GitHub Secrets)
+# EMAIL ENV
 # ==========================
 SMTP_HOST = os.getenv("SMTP_HOST")
-SMTP_PORT = _env_int("SMTP_PORT", "587")  # robust (handles empty string)
+SMTP_PORT = _env_int("SMTP_PORT", "587")
 SMTP_USER = os.getenv("SMTP_USER")
 SMTP_PASS = os.getenv("SMTP_PASS")
 MAIL_FROM = os.getenv("MAIL_FROM")
@@ -174,7 +169,6 @@ def email_send(subject: str, body: str, attachments: Optional[List[Tuple[str, pd
         _warn("EMAIL_DISABLE=1 → skipping email send")
         return
 
-    # Common reason for "no email" while workflow "succeeds"
     if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM, MAIL_TO]):
         _warn("Email not configured (missing SMTP_* or MAIL_*).")
         _warn(f"SMTP_HOST set? {bool(SMTP_HOST)}  SMTP_USER set? {bool(SMTP_USER)}  MAIL_TO set? {bool(MAIL_TO)}")
@@ -212,9 +206,9 @@ def email_send(subject: str, body: str, attachments: Optional[List[Tuple[str, pd
 
 
 # ==========================
-# yfinance (robust-ish)
+# yfinance
 # ==========================
-def _yf_download(tickers: List[str], period: str = "30d", interval: str = "1d", tries: int = 3) -> pd.DataFrame:
+def _yf_download(tickers: List[str], period: str = "45d", interval: str = "1d", tries: int = 3) -> pd.DataFrame:
     last_err = None
     for k in range(tries):
         try:
@@ -231,7 +225,7 @@ def _yf_download(tickers: List[str], period: str = "30d", interval: str = "1d", 
                 return df
         except Exception as e:
             last_err = e
-        time.sleep(1.0 + 0.5 * k)
+        time.sleep(1.0 + 0.75 * k)
     _warn(f"yfinance download empty after {tries} tries; err={last_err}")
     return pd.DataFrame()
 
@@ -239,6 +233,7 @@ def _yf_download(tickers: List[str], period: str = "30d", interval: str = "1d", 
 def _get_field_frame(frame: pd.DataFrame, field: str) -> pd.DataFrame:
     if not isinstance(frame, pd.DataFrame) or len(frame) == 0:
         raise KeyError("empty frame")
+
     if isinstance(frame.columns, pd.MultiIndex):
         fields = set(frame.columns.get_level_values(0))
         if field in fields:
@@ -247,21 +242,16 @@ def _get_field_frame(frame: pd.DataFrame, field: str) -> pd.DataFrame:
             _warn("Adj Close missing; using Close as fallback")
             return frame["Close"]
         raise KeyError(f"{field} not found in fields: {sorted(fields)}")
-    else:
-        if field in frame.columns:
-            return frame[[field]]
-        if field == "Adj Close" and "Close" in frame.columns:
-            _warn("Adj Close missing; using Close as fallback")
-            return frame[["Close"]]
-        raise KeyError(f"{field} not found in columns: {frame.columns.tolist()}")
+
+    if field in frame.columns:
+        return frame[[field]]
+    if field == "Adj Close" and "Close" in frame.columns:
+        _warn("Adj Close missing; using Close as fallback")
+        return frame[["Close"]]
+    raise KeyError(f"{field} not found in columns: {frame.columns.tolist()}")
 
 
 def _last_non_nan_prices(frame: pd.DataFrame, field: str, tickers: List[str]) -> Tuple[pd.Timestamp, pd.Series]:
-    """
-    Returns:
-      - as_of_dt: timestamp of the last available bar (index)
-      - prices: Series indexed by tickers, last non-nan per ticker.
-    """
     if not isinstance(frame, pd.DataFrame) or len(frame) == 0 or not isinstance(frame.index, pd.DatetimeIndex):
         raise RuntimeError("Invalid yfinance frame (empty or missing DatetimeIndex).")
 
@@ -278,9 +268,10 @@ def _last_non_nan_prices(frame: pd.DataFrame, field: str, tickers: List[str]) ->
                 prices[t] = np.nan
         return as_of_dt, pd.Series(prices, dtype="float64").reindex(tickers)
 
+    # single ticker case
     vv = sub.iloc[:, 0].dropna()
     v = float(vv.iloc[-1]) if len(vv) > 0 else np.nan
-    return as_of_dt, pd.Series({tickers[0]: v}, dtype="float64")
+    return as_of_dt, pd.Series({tickers[0]: v}, dtype="float64").reindex(tickers)
 
 
 # ==========================
@@ -310,7 +301,7 @@ def lockup_status(as_of: date) -> Tuple[bool, Optional[date]]:
 
 
 # ==========================
-# HOLDINGS STATE (shares per yf_ticker)
+# HOLDINGS STATE
 # ==========================
 def load_holdings() -> dict:
     return load_json(HOLDINGS_JSON)
@@ -321,10 +312,6 @@ def save_holdings(holdings: dict) -> None:
 
 
 def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_of: date) -> dict:
-    """
-    On first run: create synthetic shares matching target weights, using START_CAPITAL.
-    Also initializes rebalance_state.json (so reporting always has lock fields).
-    """
     h = load_holdings()
     if isinstance(h.get("shares"), dict) and len(h["shares"]) > 0:
         return h
@@ -341,8 +328,7 @@ def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_o
 
     shares: Dict[str, float] = {}
     for yf_t, w, p in zip(tickers, tgt, px.to_numpy(float)):
-        dollars = total * float(w)
-        shares[yf_t] = float(dollars / float(p))
+        shares[yf_t] = float((total * float(w)) / float(p))
 
     h = {
         "as_of": as_of.isoformat(),
@@ -353,16 +339,12 @@ def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_o
     _info("Initialized holdings_state.json using START_CAPITAL =", START_CAPITAL)
 
     if not Path(REBAL_JSON).exists():
-        set_rebalance_state(
-            last_rebalance_date=as_of,
-            lockup_until=as_of,
-            reason="init",
-        )
+        set_rebalance_state(last_rebalance_date=as_of, lockup_until=as_of, reason="init")
     return h
 
 
 # ==========================
-# COMPUTE allocation
+# ALLOCATION
 # ==========================
 @dataclass
 class AllocationSnapshot:
@@ -410,9 +392,6 @@ def compute_allocation(
     return AllocationSnapshot(as_of=as_of, total_value=total, table=df)
 
 
-# ==========================
-# REBALANCE execution (synthetic)
-# ==========================
 def rebalance_to_targets(port: pd.DataFrame, close_by_yf: pd.Series, total_value: float) -> Dict[str, float]:
     tickers = port["yf_ticker"].tolist()
     px = close_by_yf.reindex(tickers).astype(float)
@@ -424,13 +403,12 @@ def rebalance_to_targets(port: pd.DataFrame, close_by_yf: pd.Series, total_value
     tgt = port["target_w"].to_numpy(float)
     new_shares: Dict[str, float] = {}
     for yf_t, w, p in zip(tickers, tgt, px.to_numpy(float)):
-        dollars = float(total_value) * float(w)
-        new_shares[yf_t] = float(dollars / float(p))
+        new_shares[yf_t] = float((float(total_value) * float(w)) / float(p))
     return new_shares
 
 
 # ==========================
-# SIGNALS STATE (with first_seen/last_seen)
+# SIGNALS
 # ==========================
 def load_signals_state() -> dict:
     return load_json(SIGNALS_JSON)
@@ -466,34 +444,27 @@ def update_signal_timestamps(prev_state: dict, now_signals: dict, as_of: date) -
 
 
 # ==========================
-# HISTORY (idempotent per date) — hardened
+# HISTORY — hardened
 # ==========================
 def _normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Ensures columns exist: date, total_value
-    Accepts older variants and sloppy headers; never raises KeyError.
-    """
     if df is None or not isinstance(df, pd.DataFrame) or len(df.columns) == 0:
         return pd.DataFrame(columns=["date", "total_value"])
 
     out = df.copy()
     out.columns = [str(c).strip() for c in out.columns]
 
-    # date variants
     if "date" not in out.columns:
         for cand in ("Date", "DATE", "day", "Day", "timestamp", "Timestamp"):
             if cand in out.columns:
                 out = out.rename(columns={cand: "date"})
                 break
 
-    # value variants
     if "total_value" not in out.columns:
         for cand in ("total", "Total", "portfolio_value", "PortfolioValue", "value", "Value", "equity", "Equity"):
             if cand in out.columns:
                 out = out.rename(columns={cand: "total_value"})
                 break
 
-    # If still missing, try single numeric column heuristic
     if "total_value" not in out.columns:
         numeric_cols = []
         for c in out.columns:
@@ -535,10 +506,6 @@ def _collapse_history_df(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def update_history(as_of: date, total_value: float) -> float:
-    """
-    Write/Upsert today's history row. Return roc_1d based on prior DISTINCT date in file.
-    Hardened: will not crash even if history.csv has unexpected schema.
-    """
     cols = ["date", "total_value"]
     day = as_of.isoformat()
     new_row = pd.DataFrame([{"date": day, "total_value": float(total_value)}], columns=cols)
@@ -578,6 +545,7 @@ def update_history(as_of: date, total_value: float) -> float:
         roc_1d = float(total_value / prev_val - 1.0)
     return float(roc_1d)
 
+
 # ==========================
 # Formatting helpers
 # ==========================
@@ -590,7 +558,7 @@ def format_alloc_table(tbl: pd.DataFrame) -> str:
     lines.append(f"{'Symbol':<12} {'YF':<6} {'Now':>9} {'Target':>9} {'Band':>19} {'Status':>8} {'$Value':>14}")
     for _, r in tbl.iterrows():
         sym = str(r["symbol"])
-        yf = str(r["yf_ticker"])
+        yf_t = str(r["yf_ticker"])
         now = fmt_pct(float(r["weight_now"]))
         tgt = fmt_pct(float(r["target_w"]))
         bd = float(r["band_down"])
@@ -601,7 +569,7 @@ def format_alloc_table(tbl: pd.DataFrame) -> str:
             band = f"[{r['lo']*100:5.2f}%..{r['hi']*100:5.2f}%]"
         st = str(r["status"])
         v = float(r["value"])
-        lines.append(f"{sym:<12} {yf:<6} {now:>9} {tgt:>9} {band:>19} {st:>8} {v:>14,.2f}")
+        lines.append(f"{sym:<12} {yf_t:<6} {now:>9} {tgt:>9} {band:>19} {st:>8} {v:>14,.2f}")
     return "\n".join(lines)
 
 
@@ -635,7 +603,7 @@ def suggest_contribution_split(tbl: pd.DataFrame, contribution: float) -> pd.Dat
 
 
 # ==========================
-# DAILY JOB
+# JOBS
 # ==========================
 def daily_job() -> None:
     yf_tickers = PORT["yf_ticker"].tolist()
@@ -655,11 +623,9 @@ def daily_job() -> None:
     shares_by_yf = holdings.get("shares", {}) or {}
 
     snap = compute_allocation(PORT, shares_by_yf, close_by_yf, as_of)
-
     roc_1d = update_history(as_of, snap.total_value)
 
     sig_now = current_signal_map(snap.table)
-
     prev_sig_state = load_signals_state()
     prev_sig_map = dict(prev_sig_state.get("signals", {}) or {})
     changed = (sig_now != prev_sig_map)
@@ -697,13 +663,13 @@ def daily_job() -> None:
             snap = compute_allocation(PORT, new_shares, close_by_yf, as_of)
             sig_now = current_signal_map(snap.table)
 
-            in_lock, lock_until = lockup_status(as_of)
-            reb_state = load_rebalance_state()
-            last_reb = _parse_date(reb_state.get("last_rebalance_date"))
-
             prev_sig_state = load_signals_state()
             new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
             save_signals_state(new_sig_state)
+
+            in_lock, lock_until = lockup_status(as_of)
+            reb_state = load_rebalance_state()
+            last_reb = _parse_date(reb_state.get("last_rebalance_date"))
 
     elif sig_now and not AUTO_REBALANCE:
         reb_msg = "Auto-rebalance OFF (AUTO_REBALANCE=0)."
@@ -781,9 +747,6 @@ def daily_job() -> None:
         _info("No email sent (no breaches OR unchanged and no auto-rebalance).")
 
 
-# ==========================
-# WEEKLY JOB
-# ==========================
 def weekly_job() -> None:
     yf_tickers = PORT["yf_ticker"].tolist()
     data = _yf_download(yf_tickers, period="180d", interval="1d", tries=3)
@@ -800,7 +763,6 @@ def weekly_job() -> None:
 
     holdings = ensure_holdings_initialized(PORT, close_by_yf, as_of)
     shares_by_yf = holdings.get("shares", {}) or {}
-
     snap = compute_allocation(PORT, shares_by_yf, close_by_yf, as_of)
 
     in_lock, lock_until = lockup_status(as_of)
@@ -883,9 +845,6 @@ def weekly_job() -> None:
     )
 
 
-# ==========================
-# MAIN
-# ==========================
 def main() -> None:
     mode = (sys.argv[1] if len(sys.argv) > 1 else "daily").strip().lower()
     if mode not in ("daily", "weekly"):
