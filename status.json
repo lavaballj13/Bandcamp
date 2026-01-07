@@ -1,12 +1,12 @@
 {
   "as_of": "2026-01-06",
   "as_of_timestamp": "2026-01-06 00:00:00",
-  "anchor_rebalance_date_requested": "2025-04-16",
-  "anchor_date_used": "2025-04-16",
+  "rebalance_date_requested": "2025-04-16",
+  "anchor_used": "2025-04-16",
   "anchor_value": 100000.0,
   "total_value": 153468.9804211675,
-  "return_since_rebalance": 0.534689804211675,
   "roc_1d": 0.0,
+  "return_since_rebalance": 0.534689804211675,
   "last_rebalance_date": "2025-04-16",
   "lockup_days": 365,
   "lockup_enforced": true,
@@ -132,62 +132,18 @@
       "status": "NO_BAND"
     }
   ],
-  "prices": {
-    "anchor_close": {
-      "TQQQ": 22.645000457763672,
-      "DBMF": 25.149999618530273,
-      "XLE": 39.849998474121094,
-      "GLD": 307.4700012207031,
-      "SGOV": 100.52999877929688
-    },
-    "latest_close": {
-      "TQQQ": 55.0099983215332,
-      "DBMF": 28.440000534057617,
-      "XLE": 45.63999938964844,
-      "GLD": 413.17999267578125,
-      "SGOV": 100.43000030517578
-    }
+  "anchor_prices": {
+    "TQQQ": 22.645000457763672,
+    "DBMF": 25.149999618530273,
+    "XLE": 39.849998474121094,
+    "GLD": 307.4700012207031,
+    "SGOV": 100.52999877929688
   },
-  "price_change_since_rebalance": [
-    {
-      "symbol": "QQQSIM?L=3",
-      "yf_ticker": "TQQQ",
-      "target_w": 0.3,
-      "price_anchor": 22.645000457763672,
-      "price_now": 55.0099983215332,
-      "ret_since_rebalance": 1.4292337032244764
-    },
-    {
-      "symbol": "DBMFSIM",
-      "yf_ticker": "DBMF",
-      "target_w": 0.25,
-      "price_anchor": 25.149999618530273,
-      "price_now": 28.440000534057617,
-      "ret_since_rebalance": 0.13081514773078973
-    },
-    {
-      "symbol": "XLESIM",
-      "yf_ticker": "XLE",
-      "target_w": 0.15,
-      "price_anchor": 39.849998474121094,
-      "price_now": 45.63999938964844,
-      "ret_since_rebalance": 0.1452948842466686
-    },
-    {
-      "symbol": "GLDSIM",
-      "yf_ticker": "GLD",
-      "target_w": 0.15,
-      "price_anchor": 307.4700012207031,
-      "price_now": 413.17999267578125,
-      "ret_since_rebalance": 0.3438058706065412
-    },
-    {
-      "symbol": "CASHX.1",
-      "yf_ticker": "SGOV",
-      "target_w": 0.15,
-      "price_anchor": 100.52999877929688,
-      "price_now": 100.43000030517578,
-      "ret_since_rebalance": -0.0009947127756425589
-    }
-  ]
+  "latest_prices": {
+    "TQQQ": 55.0099983215332,
+    "DBMF": 28.440000534057617,
+    "XLE": 45.63999938964844,
+    "GLD": 413.17999267578125,
+    "SGOV": 100.43000030517578
+  }
 }
