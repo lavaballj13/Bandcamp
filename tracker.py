@@ -1033,19 +1033,23 @@ def weekly_job() -> None:
     sig_now = dict(sig_state.get("signals", {}) or {})
     first_seen = dict(sig_state.get("first_seen", {}) or {})
     last_seen = dict(sig_state.get("last_seen", {}) or {})
-
+    # --- REPLACE your daily email header block with this ---
+    
     header = [
-        f"Weekly recap — as of {as_of.isoformat()} (EOD Close)",
-        f"Total value: ${snap.total_value:,.2f}",
+        f"As of: {as_of.isoformat()} (EOD Close)",
         f"Lockup: {'ON' if ENFORCE_LOCKUP else 'OFF'} ({LOCKUP_DAYS} calendar days)",
-        f"Last rebalance (forced/normalized): {last_reb.isoformat()}",
         f"Locked until: {lock_until.isoformat() if lock_until else '—'}  (in_lockup={in_lock})",
         f"Auto-rebalance: {'ON' if AUTO_REBALANCE else 'OFF'}",
+        f"Daily email: ON",
     ]
-
+    
+    if reb_msg:
+        header.append(reb_msg)
+    
     body = "\n".join(header) + "\n\n"
     body += "Allocation / Bands:\n"
     body += format_alloc_table(snap.table) + "\n\n"
+
 
     body += "Performance (from history.csv total_value):\n"
     body += (f"- ~5d: {ret_5d*100:6.2f}%\n" if np.isfinite(ret_5d) else "- ~5d:   n/a\n")
