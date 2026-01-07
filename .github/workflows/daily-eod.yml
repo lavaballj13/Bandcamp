@@ -15,14 +15,20 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # needed to rebase safely before pushing
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+          cache: "pip"
 
       - name: Install dependencies
-        run: pip install -q pandas numpy yfinance
+        run: |
+          set -e
+          python -m pip install --upgrade pip
+          pip install -q pandas numpy yfinance
 
       - name: Daily EOD (signals + artifacts + email)
         env:
@@ -34,7 +40,6 @@ jobs:
           MAIL_TO:   ${{ secrets.MAIL_TO }}
           EMAIL_DISABLE: "0"
 
-          # tracker knobs (match your script)
           TRACKER_DEBUG: "0"
           START_CAPITAL: "100000"
           LOCKUP_DAYS: "365"
@@ -78,6 +83,10 @@ jobs:
           set -e
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add history.csv status.json signals_state.json rebalance_state.json holdings_state.json || true
           git commit -m "daily update" || echo "no changes"
+
+          # reduce non-fast-forward failures when multiple runs happen close together
+          git pull --rebase origin "${GITHUB_REF_NAME}" || true
           git push || true
