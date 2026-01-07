@@ -11,7 +11,12 @@ Robustness features:
 - yfinance: retries + last non-NaN close per ticker
 - history.csv: schema-hardened (never KeyError on total_value/date)
 - history ROC uses prior distinct date (handles reruns same day)
-- IMPORTANT CHANGE: Daily email is sent EVERY run by default (SEND_DAILY_EMAIL=1)
+- Daily email is sent EVERY run by default (SEND_DAILY_EMAIL=1)
+
+Requested tweak:
+- Force/use LAST_REBALANCE_DATE = 2025-04-16 (unless you override via env LAST_REBALANCE_DATE)
+- Ensure the 365-day lockup reflects that date (lockup_until = last_rebalance_date + LOCKUP_DAYS)
+- Rebalance state is normalized on every run so lockup fields stay consistent
 """
 
 from __future__ import annotations
@@ -35,7 +40,7 @@ import yfinance as yf
 
 
 # ==========================
-# HARDCODED PORTFOLIO
+# HARDCODED PORTFOLIO (bands are decimals: 0.10 = 10%)
 # ==========================
 PORT = pd.DataFrame(
     [
@@ -60,7 +65,7 @@ PORT = PORT.reset_index(drop=True)
 
 
 # ==========================
-# ENV
+# ENV helpers
 # ==========================
 def _env_float(name: str, default: str) -> float:
     v = os.getenv(name)
@@ -86,12 +91,15 @@ LOCKUP_DAYS = _env_int("LOCKUP_DAYS", os.getenv("TAX_LOCKUP_DAYS", "365"))
 ENFORCE_LOCKUP = _env_bool("ENFORCE_LOCKUP", "1")
 
 AUTO_REBALANCE = _env_bool("AUTO_REBALANCE", "0")
-ALWAYS_ALERT_ON_BREACH = _env_bool("ALWAYS_ALERT_ON_BREACH", "0")  # still supported
+ALWAYS_ALERT_ON_BREACH = _env_bool("ALWAYS_ALERT_ON_BREACH", "0")
 MONTHLY_CONTRIBUTION = _env_float("MONTHLY_CONTRIBUTION", "2000.0")
 DBG = _env_bool("TRACKER_DEBUG", "0")
 
-# NEW: send daily email every run by default
+# Daily email every run by default
 SEND_DAILY_EMAIL = _env_bool("SEND_DAILY_EMAIL", "1")
+
+# Force/use this last rebalance date (can override via env if you ever want)
+LAST_REBALANCE_DATE_STR = os.getenv("LAST_REBALANCE_DATE", "2025-04-16")
 
 EPS = 1e-12
 
@@ -163,6 +171,20 @@ def _parse_date(s: Optional[str]) -> Optional[date]:
         return pd.to_datetime(s).date()
     except Exception:
         return None
+
+
+def _compute_lockup_until(last_reb: date) -> date:
+    if ENFORCE_LOCKUP:
+        return last_reb + timedelta(days=int(LOCKUP_DAYS))
+    return last_reb
+
+
+def _default_last_rebalance_date() -> date:
+    d = _parse_date(LAST_REBALANCE_DATE_STR)
+    if d is None:
+        # if env is malformed, fall back hard
+        return date(2025, 4, 16)
+    return d
 
 
 # ==========================
@@ -278,7 +300,7 @@ def _last_non_nan_prices(frame: pd.DataFrame, field: str, tickers: List[str]) ->
 
 
 # ==========================
-# REBALANCE STATE
+# REBALANCE STATE (normalized each run)
 # ==========================
 def load_rebalance_state() -> dict:
     return load_json(REBAL_JSON)
@@ -295,8 +317,41 @@ def set_rebalance_state(*, last_rebalance_date: date, lockup_until: date, reason
     save_json(REBAL_JSON, st)
 
 
+def normalize_rebalance_state() -> dict:
+    """
+    Ensures rebalance_state.json always has:
+      - last_rebalance_date
+      - lockup_until computed from that + LOCKUP_DAYS (when enforced)
+      - lockup_days / lockup_enforced fields kept consistent
+
+    Also forces last_rebalance_date to LAST_REBALANCE_DATE_STR if missing/invalid.
+    """
+    st = load_rebalance_state() or {}
+
+    last_reb = _parse_date(st.get("last_rebalance_date"))
+    if last_reb is None:
+        last_reb = _default_last_rebalance_date()
+        st["reason"] = st.get("reason") or "normalized_default_last_rebalance_date"
+
+    lock_until = _parse_date(st.get("lockup_until"))
+    desired_lock_until = _compute_lockup_until(last_reb)
+
+    # If missing or inconsistent, fix it
+    if lock_until is None or lock_until != desired_lock_until:
+        lock_until = desired_lock_until
+
+    st["last_rebalance_date"] = last_reb.isoformat()
+    st["lockup_until"] = lock_until.isoformat()
+    st["lockup_days"] = int(LOCKUP_DAYS)
+    st["lockup_enforced"] = bool(ENFORCE_LOCKUP)
+    st["reason"] = st.get("reason") or "normalized"
+
+    save_json(REBAL_JSON, st)
+    return st
+
+
 def lockup_status(as_of: date) -> Tuple[bool, Optional[date]]:
-    st = load_rebalance_state()
+    st = normalize_rebalance_state()
     until = _parse_date(st.get("lockup_until"))
     if not ENFORCE_LOCKUP or until is None:
         return (False, until)
@@ -317,6 +372,8 @@ def save_holdings(holdings: dict) -> None:
 def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_of: date) -> dict:
     h = load_holdings()
     if isinstance(h.get("shares"), dict) and len(h["shares"]) > 0:
+        # still normalize rebalance state so lockup is correct relative to 2025-04-16
+        normalize_rebalance_state()
         return h
 
     tickers = port["yf_ticker"].tolist()
@@ -341,8 +398,17 @@ def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_o
     save_holdings(h)
     _info("Initialized holdings_state.json using START_CAPITAL =", START_CAPITAL)
 
+    # If rebalance state doesn't exist, create it using the requested last rebalance date
     if not Path(REBAL_JSON).exists():
-        set_rebalance_state(last_rebalance_date=as_of, lockup_until=as_of, reason="init")
+        last_reb = _default_last_rebalance_date()
+        set_rebalance_state(
+            last_rebalance_date=last_reb,
+            lockup_until=_compute_lockup_until(last_reb),
+            reason="init_with_forced_last_rebalance_date",
+        )
+    else:
+        normalize_rebalance_state()
+
     return h
 
 
@@ -372,6 +438,7 @@ def compute_allocation(
     total = float(df["value"].sum())
     df["weight_now"] = (df["value"] / total) if total > 0 else 0.0
 
+    # "Accurate bands": lo/hi derived directly from target +/- (down/up)
     df["lo"] = (df["target_w"] - df["band_down"]).clip(lower=0.0)
     df["hi"] = (df["target_w"] + df["band_up"]).clip(upper=1.0)
     df["delta_w"] = df["weight_now"] - df["target_w"]
@@ -636,9 +703,10 @@ def daily_job() -> None:
     new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
     save_signals_state(new_sig_state)
 
-    in_lock, lock_until = lockup_status(as_of)
-    reb_state = load_rebalance_state()
+    # Normalize lockup based on last rebalance date (forced to 2025-04-16 if missing/invalid)
+    reb_state = normalize_rebalance_state()
     last_reb = _parse_date(reb_state.get("last_rebalance_date"))
+    in_lock, lock_until = lockup_status(as_of)
 
     did_rebalance = False
     reb_msg = ""
@@ -653,7 +721,8 @@ def daily_job() -> None:
             holdings["as_of"] = as_of.isoformat()
             save_holdings(holdings)
 
-            until = as_of + timedelta(days=int(LOCKUP_DAYS)) if ENFORCE_LOCKUP else as_of
+            # set state based on today's rebalance
+            until = _compute_lockup_until(as_of)
             set_rebalance_state(
                 last_rebalance_date=as_of,
                 lockup_until=until,
@@ -670,9 +739,9 @@ def daily_job() -> None:
             new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
             save_signals_state(new_sig_state)
 
-            in_lock, lock_until = lockup_status(as_of)
-            reb_state = load_rebalance_state()
+            reb_state = normalize_rebalance_state()
             last_reb = _parse_date(reb_state.get("last_rebalance_date"))
+            in_lock, lock_until = lockup_status(as_of)
 
     elif sig_now and not AUTO_REBALANCE:
         reb_msg = "Auto-rebalance OFF (AUTO_REBALANCE=0)."
@@ -733,9 +802,6 @@ def daily_job() -> None:
     reb_df = rebalance_deltas(snap.table)
     contrib_df = suggest_contribution_split(snap.table, MONTHLY_CONTRIBUTION)
 
-    # IMPORTANT CHANGE:
-    # - Send daily email every run by default (SEND_DAILY_EMAIL=1)
-    # - Still retains breach-only controls if you ever set SEND_DAILY_EMAIL=0
     breach_email_logic = breaches_exist and (ALWAYS_ALERT_ON_BREACH or changed or did_rebalance)
     should_email = bool(SEND_DAILY_EMAIL) or breach_email_logic
 
@@ -778,9 +844,9 @@ def weekly_job() -> None:
     shares_by_yf = holdings.get("shares", {}) or {}
     snap = compute_allocation(PORT, shares_by_yf, close_by_yf, as_of)
 
-    in_lock, lock_until = lockup_status(as_of)
-    reb_state = load_rebalance_state()
+    reb_state = normalize_rebalance_state()
     last_reb = _parse_date(reb_state.get("last_rebalance_date"))
+    in_lock, lock_until = lockup_status(as_of)
 
     ret_5d = np.nan
     ret_mtd = np.nan
@@ -873,6 +939,7 @@ def main() -> None:
             f"ENFORCE_LOCKUP={ENFORCE_LOCKUP}",
             f"LOCKUP_DAYS={LOCKUP_DAYS}",
             f"ALWAYS_ALERT_ON_BREACH={ALWAYS_ALERT_ON_BREACH}",
+            f"LAST_REBALANCE_DATE={LAST_REBALANCE_DATE_STR}",
         )
 
     try:
