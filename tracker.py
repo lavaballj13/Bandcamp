@@ -555,7 +555,6 @@ def update_history(as_of: date, total_value: float) -> float:
 
         df = _collapse_history_df(raw)
 
-        # remove today's row first, then take previous day's value
         df_wo_today = df[df["date"].dt.date.astype(str) != day].sort_values("date")
         if len(df_wo_today) > 0 and "total_value" in df_wo_today.columns:
             try:
@@ -567,7 +566,6 @@ def update_history(as_of: date, total_value: float) -> float:
     else:
         df = new_row
 
-    # Write back canonical schema
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df["total_value"] = pd.to_numeric(df["total_value"], errors="coerce")
@@ -579,7 +577,6 @@ def update_history(as_of: date, total_value: float) -> float:
     if np.isfinite(prev_val) and prev_val > 0:
         roc_1d = float(total_value / prev_val - 1.0)
     return float(roc_1d)
-
 
 # ==========================
 # Formatting helpers
