@@ -11,7 +11,7 @@ Robustness features:
 - yfinance: retries + last non-NaN close per ticker
 - history.csv: schema-hardened (never KeyError on total_value/date)
 - history ROC uses prior distinct date (handles reruns same day)
-- weekly recap gated in workflow; code supports daily/weekly
+- IMPORTANT CHANGE: Daily email is sent EVERY run by default (SEND_DAILY_EMAIL=1)
 """
 
 from __future__ import annotations
@@ -84,10 +84,14 @@ def _env_bool(name: str, default: str = "0") -> bool:
 START_CAPITAL = _env_float("START_CAPITAL", "100000.0")
 LOCKUP_DAYS = _env_int("LOCKUP_DAYS", os.getenv("TAX_LOCKUP_DAYS", "365"))
 ENFORCE_LOCKUP = _env_bool("ENFORCE_LOCKUP", "1")
+
 AUTO_REBALANCE = _env_bool("AUTO_REBALANCE", "0")
-ALWAYS_ALERT_ON_BREACH = _env_bool("ALWAYS_ALERT_ON_BREACH", "0")
+ALWAYS_ALERT_ON_BREACH = _env_bool("ALWAYS_ALERT_ON_BREACH", "0")  # still supported
 MONTHLY_CONTRIBUTION = _env_float("MONTHLY_CONTRIBUTION", "2000.0")
 DBG = _env_bool("TRACKER_DEBUG", "0")
+
+# NEW: send daily email every run by default
+SEND_DAILY_EMAIL = _env_bool("SEND_DAILY_EMAIL", "1")
 
 EPS = 1e-12
 
@@ -268,7 +272,6 @@ def _last_non_nan_prices(frame: pd.DataFrame, field: str, tickers: List[str]) ->
                 prices[t] = np.nan
         return as_of_dt, pd.Series(prices, dtype="float64").reindex(tickers)
 
-    # single ticker case
     vv = sub.iloc[:, 0].dropna()
     v = float(vv.iloc[-1]) if len(vv) > 0 else np.nan
     return as_of_dt, pd.Series({tickers[0]: v}, dtype="float64").reindex(tickers)
@@ -695,7 +698,6 @@ def daily_job() -> None:
     Path(STATUS_JSON).write_text(json.dumps(status, indent=2), encoding="utf-8")
 
     breaches_exist = bool(sig_now)
-    should_email = breaches_exist and (ALWAYS_ALERT_ON_BREACH or changed or did_rebalance)
 
     header = [
         f"As of: {as_of.isoformat()} (EOD Close)",
@@ -704,6 +706,7 @@ def daily_job() -> None:
         f"Last rebalance: {last_reb.isoformat() if last_reb else '—'}",
         f"Locked until: {lock_until.isoformat() if lock_until else '—'}  (in_lockup={in_lock})",
         f"Auto-rebalance: {'ON' if AUTO_REBALANCE else 'OFF'}",
+        f"Daily email: {'ON' if SEND_DAILY_EMAIL else 'OFF'}",
     ]
     if reb_msg:
         header.append(reb_msg)
@@ -730,10 +733,20 @@ def daily_job() -> None:
     reb_df = rebalance_deltas(snap.table)
     contrib_df = suggest_contribution_split(snap.table, MONTHLY_CONTRIBUTION)
 
+    # IMPORTANT CHANGE:
+    # - Send daily email every run by default (SEND_DAILY_EMAIL=1)
+    # - Still retains breach-only controls if you ever set SEND_DAILY_EMAIL=0
+    breach_email_logic = breaches_exist and (ALWAYS_ALERT_ON_BREACH or changed or did_rebalance)
+    should_email = bool(SEND_DAILY_EMAIL) or breach_email_logic
+
     if should_email:
-        subj = "Portfolio — SIGNALS (bands breached)"
         if did_rebalance:
-            subj = "Portfolio — AUTO-REBALANCED (breach)"
+            subj = "Portfolio — AUTO-REBALANCED"
+        elif breaches_exist:
+            subj = "Portfolio — SIGNALS (bands breached)"
+        else:
+            subj = "Portfolio — Daily update"
+
         email_send(
             subject=subj,
             body=body,
@@ -744,7 +757,7 @@ def daily_job() -> None:
             ],
         )
     else:
-        _info("No email sent (no breaches OR unchanged and no auto-rebalance).")
+        _info("No email sent (SEND_DAILY_EMAIL=0 and no breach-trigger condition).")
 
 
 def weekly_job() -> None:
@@ -855,6 +868,7 @@ def main() -> None:
         _dbg(
             "ENV summary:",
             f"EMAIL_DISABLE={EMAIL_DISABLE}",
+            f"SEND_DAILY_EMAIL={SEND_DAILY_EMAIL}",
             f"AUTO_REBALANCE={AUTO_REBALANCE}",
             f"ENFORCE_LOCKUP={ENFORCE_LOCKUP}",
             f"LOCKUP_DAYS={LOCKUP_DAYS}",
