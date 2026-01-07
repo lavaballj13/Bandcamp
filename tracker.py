@@ -10,6 +10,7 @@ Fixes vs your original:
 - Robust env parsing for SMTP_PORT (handles empty string)
 - Correct 1d ROC when re-running on same as_of date (uses prior distinct date)
 - Single-ticker price extraction uses last non-NaN (avoids NaN crash)
+- HISTORY is hardened: never KeyError on weird/old history.csv schemas
 """
 
 from __future__ import annotations
@@ -173,7 +174,7 @@ def email_send(subject: str, body: str, attachments: Optional[List[Tuple[str, pd
         _warn("EMAIL_DISABLE=1 → skipping email send")
         return
 
-    # This is the most common reason for "no email" while workflow "succeeds"
+    # Common reason for "no email" while workflow "succeeds"
     if not all([SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, MAIL_FROM, MAIL_TO]):
         _warn("Email not configured (missing SMTP_* or MAIL_*).")
         _warn(f"SMTP_HOST set? {bool(SMTP_HOST)}  SMTP_USER set? {bool(SMTP_USER)}  MAIL_TO set? {bool(MAIL_TO)}")
@@ -191,7 +192,7 @@ def email_send(subject: str, body: str, attachments: Optional[List[Tuple[str, pd
             if isinstance(df, pd.DataFrame) and len(df) > 0:
                 df.to_csv(buf, index=False)
             else:
-                buf.write("")  # attach empty file rather than crashing
+                buf.write("")
             msg.add_attachment(
                 buf.getvalue().encode("utf-8"),
                 maintype="text",
@@ -242,7 +243,6 @@ def _get_field_frame(frame: pd.DataFrame, field: str) -> pd.DataFrame:
         fields = set(frame.columns.get_level_values(0))
         if field in fields:
             return frame[field]
-        # fallback
         if field == "Adj Close" and "Close" in fields:
             _warn("Adj Close missing; using Close as fallback")
             return frame["Close"]
@@ -268,19 +268,16 @@ def _last_non_nan_prices(frame: pd.DataFrame, field: str, tickers: List[str]) ->
     as_of_dt = pd.Timestamp(frame.index[-1]).tz_localize(None)
     sub = _get_field_frame(frame, field)
 
-    # Multi ticker: sub is DataFrame with columns tickers
     if isinstance(frame.columns, pd.MultiIndex):
         prices: Dict[str, float] = {}
         for t in tickers:
             if t in sub.columns:
-                col = sub[t]
-                vv = col.dropna()
+                vv = sub[t].dropna()
                 prices[t] = float(vv.iloc[-1]) if len(vv) > 0 else np.nan
             else:
                 prices[t] = np.nan
         return as_of_dt, pd.Series(prices, dtype="float64").reindex(tickers)
 
-    # Single ticker case: use last non-NaN (not necessarily last row)
     vv = sub.iloc[:, 0].dropna()
     v = float(vv.iloc[-1]) if len(vv) > 0 else np.nan
     return as_of_dt, pd.Series({tickers[0]: v}, dtype="float64")
@@ -309,7 +306,6 @@ def lockup_status(as_of: date) -> Tuple[bool, Optional[date]]:
     until = _parse_date(st.get("lockup_until"))
     if not ENFORCE_LOCKUP or until is None:
         return (False, until)
-    # locked strictly BEFORE until date (anniversary day is allowed)
     return (as_of < until, until)
 
 
@@ -327,7 +323,7 @@ def save_holdings(holdings: dict) -> None:
 def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_of: date) -> dict:
     """
     On first run: create synthetic shares matching target weights, using START_CAPITAL.
-    Also initializes rebalance_state.json (so email always has lock info fields).
+    Also initializes rebalance_state.json (so reporting always has lock fields).
     """
     h = load_holdings()
     if isinstance(h.get("shares"), dict) and len(h["shares"]) > 0:
@@ -351,16 +347,15 @@ def ensure_holdings_initialized(port: pd.DataFrame, close_by_yf: pd.Series, as_o
     h = {
         "as_of": as_of.isoformat(),
         "capital_init": float(START_CAPITAL),
-        "shares": shares,  # keyed by yf_ticker
+        "shares": shares,
     }
     save_holdings(h)
     _info("Initialized holdings_state.json using START_CAPITAL =", START_CAPITAL)
 
-    # Initialize rebalance state if missing (clean reporting)
     if not Path(REBAL_JSON).exists():
         set_rebalance_state(
             last_rebalance_date=as_of,
-            lockup_until=as_of,  # not locked
+            lockup_until=as_of,
             reason="init",
         )
     return h
@@ -376,7 +371,12 @@ class AllocationSnapshot:
     table: pd.DataFrame
 
 
-def compute_allocation(port: pd.DataFrame, shares_by_yf: Dict[str, float], close_by_yf: pd.Series, as_of: date) -> AllocationSnapshot:
+def compute_allocation(
+    port: pd.DataFrame,
+    shares_by_yf: Dict[str, float],
+    close_by_yf: pd.Series,
+    as_of: date,
+) -> AllocationSnapshot:
     df = port.copy()
     df["shares"] = df["yf_ticker"].map(lambda t: float(shares_by_yf.get(t, 0.0)))
     df["price"] = df["yf_ticker"].map(lambda t: float(close_by_yf.get(t, np.nan)))
@@ -449,15 +449,6 @@ def current_signal_map(tbl: pd.DataFrame) -> dict:
 
 
 def update_signal_timestamps(prev_state: dict, now_signals: dict, as_of: date) -> dict:
-    """
-    prev_state schema:
-      {
-        "as_of": "...",
-        "signals": {sym: "LOW/HIGH", ...},
-        "first_seen": {sym: "YYYY-MM-DD", ...},
-        "last_seen": {sym: "YYYY-MM-DD", ...}
-      }
-    """
     first_seen = dict(prev_state.get("first_seen", {}) or {})
     last_seen = dict(prev_state.get("last_seen", {}) or {})
 
@@ -475,49 +466,114 @@ def update_signal_timestamps(prev_state: dict, now_signals: dict, as_of: date) -
 
 
 # ==========================
-# HISTORY (idempotent per date)
+# HISTORY (idempotent per date) — hardened
 # ==========================
+def _normalize_history_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ensures columns exist: date, total_value
+    Accepts older variants and sloppy headers; never raises KeyError.
+    """
+    if df is None or not isinstance(df, pd.DataFrame) or len(df.columns) == 0:
+        return pd.DataFrame(columns=["date", "total_value"])
+
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.columns]
+
+    # date variants
+    if "date" not in out.columns:
+        for cand in ("Date", "DATE", "day", "Day", "timestamp", "Timestamp"):
+            if cand in out.columns:
+                out = out.rename(columns={cand: "date"})
+                break
+
+    # value variants
+    if "total_value" not in out.columns:
+        for cand in ("total", "Total", "portfolio_value", "PortfolioValue", "value", "Value", "equity", "Equity"):
+            if cand in out.columns:
+                out = out.rename(columns={cand: "total_value"})
+                break
+
+    # If still missing, try single numeric column heuristic
+    if "total_value" not in out.columns:
+        numeric_cols = []
+        for c in out.columns:
+            if c == "date":
+                continue
+            s = pd.to_numeric(out[c], errors="coerce")
+            if s.notna().any():
+                numeric_cols.append(c)
+        if len(numeric_cols) == 1:
+            out = out.rename(columns={numeric_cols[0]: "total_value"})
+
+    if "date" not in out.columns:
+        return pd.DataFrame(columns=["date", "total_value"])
+
+    if "total_value" not in out.columns:
+        _warn("history.csv missing total_value column; columns were:", out.columns.tolist())
+        out["total_value"] = np.nan
+
+    return out[["date", "total_value"]].copy()
+
+
 def _collapse_history_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or len(df) == 0:
-        return df
+        return pd.DataFrame(columns=["date", "total_value"])
+
+    df = _normalize_history_columns(df)
+
     df = df.copy()
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["total_value"] = pd.to_numeric(df["total_value"], errors="coerce")
+
     df = df.dropna(subset=["date"]).sort_values("date")
+    if len(df) == 0:
+        return pd.DataFrame(columns=["date", "total_value"])
+
     g = df.groupby(df["date"].dt.date, as_index=False).last()
-    g["date"] = pd.to_datetime(g["date"])
+    g["date"] = pd.to_datetime(g["date"], errors="coerce")
     return g
 
 
 def update_history(as_of: date, total_value: float) -> float:
     """
     Write/Upsert today's history row. Return roc_1d based on prior DISTINCT date in file.
-    (Fixes rerun-on-same-date returning ~0 or nonsense.)
+    Hardened: will not crash even if history.csv has unexpected schema.
     """
     cols = ["date", "total_value"]
     day = as_of.isoformat()
     new_row = pd.DataFrame([{"date": day, "total_value": float(total_value)}], columns=cols)
 
     path = Path(HISTORY_CSV)
+    prev_val = np.nan
+
     if path.exists():
         try:
-            df = pd.read_csv(path, parse_dates=["date"])
-        except Exception:
-            df = pd.DataFrame(columns=cols)
+            raw = pd.read_csv(path)
+        except Exception as e:
+            _warn("history.csv unreadable; resetting. err=", repr(e))
+            raw = pd.DataFrame(columns=cols)
 
-        df = _collapse_history_df(df)
+        df = _collapse_history_df(raw)
 
         # remove today's row first, then take previous day's value
         df_wo_today = df[df["date"].dt.date.astype(str) != day].sort_values("date")
-        prev_val = float(df_wo_today["total_value"].iloc[-1]) if len(df_wo_today) > 0 else np.nan
+        if len(df_wo_today) > 0 and "total_value" in df_wo_today.columns:
+            try:
+                prev_val = float(df_wo_today["total_value"].iloc[-1])
+            except Exception:
+                prev_val = np.nan
 
         df = pd.concat([df_wo_today, new_row], ignore_index=True)
     else:
         df = new_row
-        prev_val = np.nan
 
-    df = df.sort_values("date")
-    df["date"] = pd.to_datetime(df["date"]).dt.strftime("%Y-%m-%d")
-    df.to_csv(path, index=False)
+    # Write back canonical schema
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["total_value"] = pd.to_numeric(df["total_value"], errors="coerce")
+    df = df.dropna(subset=["date"]).sort_values("date")
+    df["date"] = df["date"].dt.strftime("%Y-%m-%d")
+    df[cols].to_csv(path, index=False)
 
     roc_1d = 0.0
     if np.isfinite(prev_val) and prev_val > 0:
@@ -563,10 +619,6 @@ def rebalance_deltas(tbl: pd.DataFrame) -> pd.DataFrame:
 
 
 def suggest_contribution_split(tbl: pd.DataFrame, contribution: float) -> pd.DataFrame:
-    """
-    Allocate contribution dollars to underweights proportionally to deficit (target - current).
-    If nothing is underweight, allocate by target weights.
-    """
     df = tbl.copy()
     df["deficit"] = np.maximum(0.0, df["target_w"] - df["weight_now"])
 
@@ -591,7 +643,6 @@ def suggest_contribution_split(tbl: pd.DataFrame, contribution: float) -> pd.Dat
 def daily_job() -> None:
     yf_tickers = PORT["yf_ticker"].tolist()
 
-    # Pull enough history to survive NaNs / missing latest
     data = _yf_download(yf_tickers, period="45d", interval="1d", tries=3)
     if not isinstance(data, pd.DataFrame) or len(data) == 0 or not isinstance(data.index, pd.DatetimeIndex):
         raise RuntimeError("yfinance returned no usable data; cannot run daily job.")
@@ -610,18 +661,15 @@ def daily_job() -> None:
 
     roc_1d = update_history(as_of, snap.total_value)
 
-    # Signals
     sig_now = current_signal_map(snap.table)
 
     prev_sig_state = load_signals_state()
     prev_sig_map = dict(prev_sig_state.get("signals", {}) or {})
     changed = (sig_now != prev_sig_map)
 
-    # Always update timestamps even if unchanged (keeps last_seen current)
     new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
     save_signals_state(new_sig_state)
 
-    # Lockup state
     in_lock, lock_until = lockup_status(as_of)
     reb_state = load_rebalance_state()
     last_reb = _parse_date(reb_state.get("last_rebalance_date"))
@@ -629,7 +677,6 @@ def daily_job() -> None:
     did_rebalance = False
     reb_msg = ""
 
-    # Auto rebalance only if breach exists
     if sig_now and AUTO_REBALANCE:
         if ENFORCE_LOCKUP and in_lock:
             reb_msg = f"Auto-rebalance BLOCKED by lockup (until {lock_until.isoformat() if lock_until else '—'})."
@@ -650,7 +697,6 @@ def daily_job() -> None:
             did_rebalance = True
             reb_msg = f"Auto-rebalance EXECUTED. Lockup until {until.isoformat()}."
 
-            # Recompute after rebalance
             snap = compute_allocation(PORT, new_shares, close_by_yf, as_of)
             sig_now = current_signal_map(snap.table)
 
@@ -658,7 +704,6 @@ def daily_job() -> None:
             reb_state = load_rebalance_state()
             last_reb = _parse_date(reb_state.get("last_rebalance_date"))
 
-            # Update signals timestamps again post-rebalance
             prev_sig_state = load_signals_state()
             new_sig_state = update_signal_timestamps(prev_sig_state, sig_now, as_of)
             save_signals_state(new_sig_state)
@@ -666,7 +711,6 @@ def daily_job() -> None:
     elif sig_now and not AUTO_REBALANCE:
         reb_msg = "Auto-rebalance OFF (AUTO_REBALANCE=0)."
 
-    # status.json (single source of truth snapshot)
     status = {
         "as_of": as_of.isoformat(),
         "as_of_timestamp": str(as_of_dt),
@@ -690,7 +734,6 @@ def daily_job() -> None:
     breaches_exist = bool(sig_now)
     should_email = breaches_exist and (ALWAYS_ALERT_ON_BREACH or changed or did_rebalance)
 
-    # Email body (includes lockup and breach timestamps)
     header = [
         f"As of: {as_of.isoformat()} (EOD Close)",
         f"Total value: ${snap.total_value:,.2f}   1d ROC: {roc_1d*100:+.2f}%",
@@ -767,14 +810,17 @@ def weekly_job() -> None:
     reb_state = load_rebalance_state()
     last_reb = _parse_date(reb_state.get("last_rebalance_date"))
 
-    # Performance from history.csv
     ret_5d = np.nan
     ret_mtd = np.nan
     ret_ytd = np.nan
+    hist_df = pd.DataFrame(columns=["date", "total_value"])
+
     if Path(HISTORY_CSV).exists():
         try:
-            hist = pd.read_csv(HISTORY_CSV, parse_dates=["date"])
-            hist = _collapse_history_df(hist).sort_values("date")
+            raw_hist = pd.read_csv(HISTORY_CSV)
+            hist = _collapse_history_df(raw_hist).sort_values("date")
+            hist_df = hist.copy()
+
             if len(hist) >= 2:
                 if len(hist) >= 6:
                     v0 = float(hist["total_value"].iloc[-6])
@@ -827,8 +873,6 @@ def weekly_job() -> None:
 
     reb_df = rebalance_deltas(snap.table)
     contrib_df = suggest_contribution_split(snap.table, MONTHLY_CONTRIBUTION)
-
-    hist_df = pd.read_csv(HISTORY_CSV) if Path(HISTORY_CSV).exists() else pd.DataFrame()
 
     email_send(
         subject="Portfolio — Weekly recap",
