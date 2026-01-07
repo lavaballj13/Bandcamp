@@ -18,11 +18,6 @@ jobs:
         with:
           fetch-depth: 0   # needed to rebase safely before pushing
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: "pip"
 
       - name: Install dependencies
         run: |
