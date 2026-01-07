@@ -1,7 +1,7 @@
 {
-  "last_rebalance_date": "2026-01-06",
-  "lockup_until": "2027-01-06",
+  "last_rebalance_date": "2025-04-16",
+  "lockup_until": "2026-04-16",
   "lockup_days": 365,
   "lockup_enforced": true,
-  "reason": "init"
+  "reason": "forced_last_rebalance_date"
 }
